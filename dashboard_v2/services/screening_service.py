@@ -146,11 +146,24 @@ def analyze_symbol(
     # engine. Re-scan the latest bars only to expose secondary detector diagnostics.
     # This scan never replaces the active candidate pivot.
     rebase_start = state.get("rebase_started_at")
+    # Keep the diagnostic scan's historical context consistent with the replay
+    # detector. If the preserved breakout event is older than the visible 120-bar
+    # window, passing that date as an explicit event makes Base-on-Base detection
+    # fail (the event cannot be found in the frame). In that case the detector
+    # must infer the observed crossing from the visible bars, as replay_symbol does.
+    diagnostic_bars = bars.tail(120).reset_index(drop=True)
+    diagnostic_breakout_date = state.get("breakout_date")
+    if diagnostic_breakout_date is not None and not diagnostic_bars.empty:
+        try:
+            if pd.Timestamp(diagnostic_breakout_date).date() < diagnostic_bars["Date"].iloc[0].date():
+                diagnostic_breakout_date = None
+        except (TypeError, ValueError):
+            diagnostic_breakout_date = None
     secondary = detect_pattern_candidates(
-        bars.tail(120),
+        diagnostic_bars,
         rebase_started_at=rebase_start if bool(state.get("rebase_active", False)) else None,
         prior_breakout_pivot=breakout_pivot,
-        prior_breakout_date=state.get("breakout_date"),
+        prior_breakout_date=diagnostic_breakout_date,
     )
     primary = select_primary_pattern(secondary)
     current_pattern = str(state.get("pattern") or "BASE FORMING / NO VALID PATTERN")

@@ -90,3 +90,19 @@ def test_analyze_symbol_resumes_after_bundled_snapshot_when_new_bar_arrives():
     assert result["candidate_pivot"] is None
     assert result["stage"] == "BASE"
     assert result["breakout_pivot"] == seed_map["AMAT"]["breakout_pivot"]
+
+
+def test_secondary_pattern_diagnostic_uses_same_windowed_breakout_context():
+    """A breakout date outside the 120-bar detector window must be inferred.
+
+    GOOG's bundled state is Base-on-Base with a preserved breakout event from
+    January. The visible 120-bar detector window starts later; passing the old
+    event date literally suppresses Base-on-Base in diagnostics and yields a
+    misleading Double Bottom label.
+    """
+    root = Path(__file__).resolve().parents[1]
+    seed_map = load_seed_snapshots(root / "data" / "regression" / "chronological_replay.csv")
+    bars = pd.read_csv(root / "data" / "regression" / "ohlcv" / "GOOG.csv")
+    result = analyze_symbol("GOOG", bars, seed_snapshot=seed_map["GOOG"])
+    assert result["pattern"] == "Base-on-Base"
+    assert result["detected_pattern_diagnostic"] == result["pattern"]
