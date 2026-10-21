@@ -65,6 +65,9 @@ def test_rebase_snapshot_cannot_display_breakout_stage():
     assert result["candidate_pivot"] is None
     assert result["stage"] == "BASE"
     assert result["breakout_pivot"] == 90.0
+    assert result["rebase_low"] == 95.0
+    assert result["rebase_low_date"] == "2026-03-02"
+    assert result["rebase_reason"] == "20D_HIGH_DRAWDOWN"
 
 
 def test_analyze_symbol_resumes_after_bundled_snapshot_when_new_bar_arrives():

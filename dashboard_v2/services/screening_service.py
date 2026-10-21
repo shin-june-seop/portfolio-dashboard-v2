@@ -201,6 +201,12 @@ def analyze_symbol(
         "rebase_active": bool(state.get("rebase_active", False)),
         "rebase_started_at": _date_string(state.get("rebase_started_at")),
         "rebase_reason": (None if state.get("rebase_reason") is None or pd.isna(state.get("rebase_reason")) else str(state.get("rebase_reason"))),
+        # Expose the carried rebase-cycle low so the UI can verify whether a
+        # lower completed-bar Low updates the price/date without resetting start.
+        "rebase_low": _num(state.get("rebase_low")),
+        "rebase_low_date": _date_string(state.get("rebase_low_date")),
+        "rebase_secondary_reasons": (None if state.get("rebase_secondary_reasons") is None or pd.isna(state.get("rebase_secondary_reasons")) else str(state.get("rebase_secondary_reasons"))),
+        "breakout_date": _date_string(state.get("breakout_date")),
         "breakout_cycle_active": bool(state.get("breakout_cycle_active", False)),
         "breakout_event": bool(state.get("breakout_event", False)),
         "breakout_failure": bool(state.get("breakout_failure", False)),
