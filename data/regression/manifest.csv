@@ -1,0 +1,8 @@
+case_id,ticker,scenario,as_of_date,rebase_started_at,prior_breakout_pivot,prior_breakout_date,expected_pattern,expected_candidate_pivot_min,expected_candidate_pivot_max,notes
+AMAT_REBASE_STALE_PATTERN,AMAT,"After rebase, old Double Bottom must not remain active unless a new-cycle pattern independently validates",,,,,,,,"Requires the historical date and expected new-cycle result to be labelled from the original chart/dashboard"
+MU_REBASE_STALE_PATTERN,MU,"After rebase, old pattern invalidation and new base formation must follow the rebase cycle",,,,,,,,"Requires the historical date and expected new-cycle result to be labelled from the original chart/dashboard"
+SOXX_REBASE_STALE_PATTERN,SOXX,"After rebase, stale pre-drop Double Bottom must not be reused",,,,,,,,"Requires the historical date and expected new-cycle result to be labelled from the original chart/dashboard"
+META_BREAKOUT_PIVOT_PRESERVED,META,"Candidate pivot may update but the historical Breakout Pivot remains independent",,,,,,,,"Legacy reference noted near 718.45; record the exact date and price basis before using numeric comparison"
+GOOG_CANDIDATE_VS_BREAKOUT,GOOG,"Candidate pivot may change without overwriting the recorded historical Breakout Pivot",,,,,,,,"Record the as-of date and both pivots from the existing dashboard/journal"
+STX_BREAKOUT_FAILURE,STX,"Official failure is triggered only by a completed EOD close below the active Breakout Pivot",,,,,,,,"Record the relevant EOD date and active pivot; intraday-only breaches are not failures"
+LRCX_INITIAL_RISK,LRCX,"Initial Risk must be calculated from the entry-time price/ATR and must not change retroactively",,,,,,,,"Record the actual entry date, entry price, ATR(14) at entry, and historical saved risk if available"

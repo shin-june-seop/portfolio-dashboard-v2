@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "portfolio-dashboard-v2"
+version = "0.3.0"
+description = "Clean-room V2 architecture for a rule-based portfolio dashboard"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "streamlit>=1.39,<2.0",
+  "pandas>=2.1,<4.0",
+  "numpy>=1.26,<3.0",
+]
+
+[project.optional-dependencies]
+database = ["supabase>=2.0,<3.0"]
+market-data = ["yfinance>=0.2"]
+test = ["pytest>=8.0", "pytest-cov>=5.0"]
+
+[tool.setuptools.packages.find]
+include = ["dashboard_v2*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
