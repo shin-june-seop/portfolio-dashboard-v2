@@ -98,6 +98,7 @@ def replay_symbol(
         # carried incrementally by the state machine, so passing the full prefix is
         # both unnecessary and a major historical-replay performance penalty.
         trigger_history = history.tail(20).reset_index(drop=True)
+        rebase_was_active = rebase_state.active
         updated_rebase = update_rebase_state(
             trigger_history, as_of_date=asof, close=close,
             previous_candidate_pivot=prior_candidate,
@@ -159,6 +160,16 @@ def replay_symbol(
             candidate_start = None
             candidate_source = None
 
+        # A prior breakout cycle cannot remain active during an existing rebase,
+        # nor when a new rebase starts for a reason other than an official breakout
+        # failure. On the first breakout-failure bar, keep it active just long enough
+        # for stage_engine to emit the BREAKOUT FAILURE event; the handler below closes it.
+        # Historical breakout_pivot / breakout_date are preserved independently.
+        if updated_rebase.active and (
+            rebase_was_active or updated_rebase.primary_reason != "BREAKOUT_FAILURE"
+        ):
+            breakout_active = False
+
         # Use detector output only when it is valid for the current state. A
         # historical Breakout Pivot is never replaced by a newly scanned pivot.
         stage = evaluate_official_stage(StageInput(
@@ -200,6 +211,12 @@ def replay_symbol(
                 # A subsequent candidate breakout starts a new cycle and replaces
                 # the displayed Breakout Pivot at that event only.
                 breakout_active = False
+
+        # Keep the invariant explicit even if future stage logic adds another event
+        # branch: an active rebase and the prior breakout cycle cannot coexist.
+        # BREAKOUT FAILURE is still emitted on the trigger day, but the cycle closes.
+        if updated_rebase.active:
+            breakout_active = False
 
         rows.append({
             "ticker": symbol.upper(),
