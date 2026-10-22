@@ -101,3 +101,77 @@ def test_resume_from_snapshot_preserves_breakout_pivot_and_processes_new_eod_fai
     assert latest["breakout_pivot"] == 105.0
     assert latest["rebase_active"]
     assert pd.isna(latest["candidate_pivot"])
+
+
+def test_rebase_closes_old_breakout_cycle_but_preserves_historical_pivot():
+    # Candidate drawdown starts a rebase while price remains well above the old
+    # Breakout Pivot. The old cycle ends, but its pivot/date stay as history.
+    closes = [100.0] * 19 + [89.0]
+    frame = bars(closes)
+    result = replay_symbol(
+        "TEST", frame, pattern_detector=always_pattern,
+        initial_candidate_pivot=100.0,
+        initial_breakout_pivot=70.0,
+        initial_breakout_date=date(2026, 1, 2),
+        initial_breakout_active=True,
+    )
+    last = result.iloc[-1]
+    assert bool(last["rebase_active"])
+    assert last["rebase_reason"] == "CANDIDATE_PIVOT_DRAWDOWN"
+    assert not bool(last["breakout_failure"])
+    assert last["breakout_pivot"] == 70.0
+    assert last["breakout_date"] == "2026-01-02"
+    assert not bool(last["breakout_cycle_active"])
+
+
+def test_new_candidate_replaces_breakout_pivot_only_when_crossed():
+    # Rebase ends with a candidate at 180 while price is still below it. The old
+    # historical pivot (300) remains displayed until the next day's actual cross.
+    dates = pd.bdate_range("2026-10-20", periods=3)
+    closes = [170.0, 175.0, 181.0]
+    frame = pd.DataFrame({
+        "Date": dates,
+        "Open": [x - 0.5 for x in closes],
+        "High": [x + 1.0 for x in closes],
+        "Low": [x - 1.0 for x in closes],
+        "Close": closes,
+        "Volume": [1000] * len(closes),
+    })
+
+    def candidate_180(*args, **kwargs):
+        return PatternCandidate("Flat Base", True, 180.0, date(2026, 10, 1), 180.0)
+
+    snapshot = {
+        "as_of_date": dates[0].date().isoformat(),
+        "close": 170.0,
+        "candidate_pivot": None,
+        "breakout_pivot": 300.0,
+        "breakout_date": "2026-10-01",
+        "breakout_cycle_active": True,  # legacy contradictory state
+        "stage": "BASE",
+        "rebase_active": True,
+        "rebase_started_at": "2026-10-10",
+        "rebase_low": 150.0,
+        "rebase_low_date": "2026-10-15",
+        "rebase_reason": "CANDIDATE_PIVOT_DRAWDOWN",
+        "rebase_secondary_reasons": "",
+    }
+    result = replay_symbol(
+        "TEST", frame, pattern_detector=candidate_180,
+        resume_snapshot=snapshot,
+        process_from_date=dates[0].date(),
+    )
+    assert len(result) == 2
+    candidate_day = result.iloc[0]
+    assert not bool(candidate_day["rebase_active"])
+    assert candidate_day["candidate_pivot"] == 180.0
+    assert candidate_day["breakout_pivot"] == 300.0
+    assert not bool(candidate_day["breakout_event"])
+    assert not bool(candidate_day["breakout_cycle_active"])
+
+    breakout_day = result.iloc[1]
+    assert bool(breakout_day["breakout_event"])
+    assert breakout_day["stage"] == "BREAKOUT"
+    assert breakout_day["breakout_pivot"] == 180.0
+    assert breakout_day["breakout_date"] == dates[2].date().isoformat()
+    assert bool(breakout_day["breakout_cycle_active"])
