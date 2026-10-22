@@ -73,6 +73,12 @@ def replay_symbol(
             primary_reason=(str(resume_snapshot.get("rebase_reason")) if resume_snapshot.get("rebase_reason") and pd.notna(resume_snapshot.get("rebase_reason")) else None),
             secondary_reasons=tuple(str(resume_snapshot.get("rebase_secondary_reasons", "") or "").split("|")) if resume_snapshot.get("rebase_secondary_reasons") and pd.notna(resume_snapshot.get("rebase_secondary_reasons")) else (),
         )
+        # A rebase closes the old breakout *cycle*, but does not erase the
+        # historical Breakout Pivot. Older snapshots may contain the legacy
+        # contradictory combination rebase_active=True / breakout_cycle_active=True;
+        # normalize that combination when resuming replay.
+        if rebase_state.active:
+            breakout_active = False
 
     rows: list[dict[str, Any]] = []
 
@@ -183,9 +189,17 @@ def replay_symbol(
             rebase_state = updated_rebase
             candidate_pivot = active_candidate_pivot
             if stage.breakout_event:
+                # The Breakout Pivot changes only on an actual upward cross of a
+                # valid candidate pivot. Until then, keep the last historical value.
                 breakout_pivot = float(stage.activate_breakout_pivot)
                 breakout_date = asof
                 breakout_active = True
+            elif updated_rebase.active:
+                # Invalidate the prior breakout cycle as soon as a rebase is active,
+                # while retaining breakout_pivot / breakout_date as historical data.
+                # A subsequent candidate breakout starts a new cycle and replaces
+                # the displayed Breakout Pivot at that event only.
+                breakout_active = False
 
         rows.append({
             "ticker": symbol.upper(),
