@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from functools import lru_cache
 import math
 
 import pandas as pd
@@ -36,6 +37,268 @@ def load_seed_snapshots(path: Path | str = SEED_REPLAY_PATH) -> dict[str, dict[s
     latest = frame.sort_values("as_of_date").groupby("ticker", as_index=False).tail(1)
     return {str(row["ticker"]).upper(): row.to_dict() for _, row in latest.iterrows()}
 
+
+@lru_cache(maxsize=4)
+def _load_seed_replay_history(path_text: str) -> pd.DataFrame:
+    """Load the corrected replay ledger for guarded historical-event recovery.
+
+    This ledger is not trusted for numeric pivot prices under the new OHLC basis.
+    It contributes candidate event dates and pattern names only; every recovered
+    event must be re-detected and re-crossed using the current raw OHLC bars.
+    """
+    path = Path(path_text)
+    if not path.exists():
+        return pd.DataFrame()
+    frame = pd.read_csv(path)
+    required = {"ticker", "as_of_date", "pattern", "breakout_event"}
+    if frame.empty or not required.issubset(frame.columns):
+        return pd.DataFrame()
+    frame = frame.copy()
+    frame["ticker"] = frame["ticker"].astype(str).str.upper().str.strip()
+    frame["as_of_date"] = pd.to_datetime(frame["as_of_date"], errors="coerce")
+    return frame.dropna(subset=["as_of_date"]).sort_values(
+        ["ticker", "as_of_date"]
+    ).reset_index(drop=True)
+
+
+def _flag_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or pd.isna(value):
+        return False
+    return str(value).strip().lower() in {"true", "1", "1.0", "yes", "y"}
+
+
+def _historical_rebase_start(
+    seed_symbol_history: pd.DataFrame, event_date: pd.Timestamp
+) -> Any | None:
+    """Return the latest recorded rebase start before an event, as a date clue only."""
+    if seed_symbol_history.empty or not {"rebase_active", "rebase_started_at"}.issubset(seed_symbol_history.columns):
+        return None
+    prior = seed_symbol_history.loc[seed_symbol_history["as_of_date"] < event_date]
+    if prior.empty:
+        return None
+    active = prior.loc[prior["rebase_active"].map(_flag_value)]
+    if active.empty:
+        return None
+    values = active["rebase_started_at"].dropna()
+    if values.empty:
+        return None
+    try:
+        return pd.Timestamp(values.iloc[-1]).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _revalidate_seed_breakout_events(
+    symbol: str,
+    bars: pd.DataFrame,
+    *,
+    seed_path: Path | str = SEED_REPLAY_PATH,
+    attempts: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Revalidate seed breakout dates against current-basis completed OHLC bars.
+
+    The historical ledger contributes event *dates* only. Its pattern label and
+    numeric pivot are not ground truth after a price-basis change. At each seed
+    event date, the current canonical detector chooses the primary valid pattern
+    on the preceding completed bar; we recover an event only if the following
+    completed close crosses that freshly calculated candidate pivot upward.
+    A changed pattern label therefore does not, by itself, erase a historical
+    crossing, but no event is restored without a current-pattern EOD cross.
+    Optional ``attempts`` captures why an event date was or wasn't revalidated.
+    """
+    diagnostics = attempts if attempts is not None else []
+    seed = _load_seed_replay_history(str(Path(seed_path)))
+    ticker = str(symbol).upper().strip()
+    if seed.empty or bars is None or bars.empty:
+        diagnostics.append({"reason": "NO_SEED_LEDGER_OR_BARS"})
+        return []
+
+    technical = normalize_ohlcv(bars).tail(300).reset_index(drop=True)
+    if len(technical) < 2:
+        diagnostics.append({"reason": "INSUFFICIENT_TECHNICAL_BARS", "bars": len(technical)})
+        return []
+    first_date = pd.Timestamp(technical["Date"].iloc[0]).normalize()
+    last_date = pd.Timestamp(technical["Date"].iloc[-1]).normalize()
+    seed_symbol = seed.loc[seed["ticker"] == ticker].copy()
+    if seed_symbol.empty:
+        diagnostics.append({"reason": "NO_SYMBOL_IN_SEED_LEDGER", "ticker": ticker})
+        return []
+    events = seed_symbol.loc[seed_symbol["breakout_event"].map(_flag_value)].copy()
+    events = events.loc[
+        (events["as_of_date"] >= first_date) & (events["as_of_date"] <= last_date)
+    ].sort_values("as_of_date")
+    if events.empty:
+        diagnostics.append({
+            "reason": "NO_SEED_BREAKOUT_DATE_IN_ROLLING_WINDOW",
+            "window_start": first_date.date().isoformat(),
+            "window_end": last_date.date().isoformat(),
+        })
+        return []
+
+    recovered: list[dict[str, Any]] = []
+    prior_validated_pivot: float | None = None
+    prior_validated_date: str | None = None
+    for _, event in events.iterrows():
+        event_date = pd.Timestamp(event["as_of_date"]).normalize()
+        seed_pattern = str(event.get("pattern") or "").strip()
+        attempt: dict[str, Any] = {
+            "event_date": event_date.date().isoformat(),
+            "seed_pattern": seed_pattern or None,
+        }
+        matches = technical.index[technical["Date"] == event_date].tolist()
+        if not matches:
+            attempt["reason"] = "EVENT_BAR_MISSING_FROM_CURRENT_OHLC"
+            diagnostics.append(attempt)
+            continue
+        event_idx = matches[-1]
+        if event_idx <= 0:
+            attempt["reason"] = "PREVIOUS_COMPLETED_BAR_MISSING"
+            diagnostics.append(attempt)
+            continue
+        current_bar = technical.iloc[event_idx]
+        previous_bar = technical.iloc[event_idx - 1]
+
+        # Only information available before the event session may define its pivot.
+        prior_bars = technical.iloc[:event_idx].tail(120).reset_index(drop=True)
+        if len(prior_bars) < 20:
+            attempt["reason"] = "INSUFFICIENT_PRE_EVENT_CONTEXT"
+            attempt["pre_event_bars"] = int(len(prior_bars))
+            diagnostics.append(attempt)
+            continue
+        rebase_start = _historical_rebase_start(seed_symbol, event_date)
+        candidates = detect_pattern_candidates(
+            prior_bars,
+            rebase_started_at=rebase_start,
+            prior_breakout_pivot=prior_validated_pivot,
+            prior_breakout_date=prior_validated_date,
+        )
+        primary = select_primary_pattern(candidates)
+        if primary is None:
+            attempt["reason"] = "NO_VALID_PRIMARY_PATTERN_ON_PREVIOUS_BAR"
+            diagnostics.append(attempt)
+            continue
+        pivot = _num(primary.candidate_pivot)
+        previous_close = _num(previous_bar["Close"])
+        event_close = _num(current_bar["Close"])
+        attempt.update({
+            "current_primary_pattern": primary.pattern_name,
+            "candidate_pivot": pivot,
+            "previous_close": previous_close,
+            "event_close": event_close,
+            "seed_pattern_matches_current": (
+                primary.pattern_name.strip().casefold() == seed_pattern.casefold()
+                if seed_pattern else None
+            ),
+        })
+        if pivot is None or previous_close is None or event_close is None:
+            attempt["reason"] = "INVALID_CURRENT_BASIS_PRICE_OR_PIVOT"
+            diagnostics.append(attempt)
+            continue
+        # Official EOD upward-cross relationship on current split-normalized OHLC.
+        if not (previous_close <= pivot < event_close):
+            attempt["reason"] = "NO_CURRENT_BASIS_UPWARD_CLOSE_CROSS"
+            diagnostics.append(attempt)
+            continue
+
+        recovered_event = {
+            "event_date": event_date.date().isoformat(),
+            "pattern": primary.pattern_name,
+            "seed_pattern": seed_pattern or None,
+            "seed_pattern_matches_current": attempt["seed_pattern_matches_current"],
+            "candidate_pivot": float(pivot),
+            "pattern_start_date": (
+                primary.pattern_start_date.isoformat() if primary.pattern_start_date else None
+            ),
+            "previous_close": float(previous_close),
+            "event_close": float(event_close),
+        }
+        recovered.append(recovered_event)
+        attempt["reason"] = "SEED_EVENT_REVALIDATED_ON_CURRENT_OHLC"
+        diagnostics.append(attempt)
+        prior_validated_pivot = float(pivot)
+        prior_validated_date = event_date.date().isoformat()
+    return recovered
+
+
+def _reconcile_historical_breakout(
+    symbol: str, bars: pd.DataFrame, state: dict[str, Any], provenance: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Restore last historical breakout metadata only from a current-basis cross.
+
+    The event ledger supplies dates, not prices. Candidate, stage, rebase flags and
+    active-cycle state always come from the live replay and are never overwritten.
+    """
+    diagnostic: dict[str, Any] = {
+        "historical_breakout_recovered": False,
+        "historical_breakout_recovery_pattern": None,
+        "historical_breakout_recovery_event_date": None,
+        "historical_breakout_recovery_reason": "NO_CURRENT_BASIS_EVENT_REVALIDATED",
+        "historical_breakout_recovery_seed_pattern": None,
+        "historical_breakout_recovery_seed_pattern_matches_current": None,
+        "historical_breakout_recovery_candidate_pivot": None,
+        "historical_breakout_recovery_previous_close": None,
+        "historical_breakout_recovery_event_close": None,
+        "historical_breakout_recovery_attempted_event_date": None,
+    }
+    if provenance != "ROLLING_300_BAR_REPLAY":
+        diagnostic["historical_breakout_recovery_reason"] = "NOT_A_ROLLING_REPLAY"
+        return dict(state), diagnostic
+
+    attempts: list[dict[str, Any]] = []
+    events = _revalidate_seed_breakout_events(symbol, bars, attempts=attempts)
+    if not events:
+        if attempts:
+            latest_attempt = attempts[-1]
+            diagnostic["historical_breakout_recovery_reason"] = str(
+                latest_attempt.get("reason", "NO_CURRENT_BASIS_EVENT_REVALIDATED")
+            )
+            diagnostic["historical_breakout_recovery_attempted_event_date"] = latest_attempt.get("event_date")
+            diagnostic["historical_breakout_recovery_seed_pattern"] = latest_attempt.get("seed_pattern")
+            diagnostic["historical_breakout_recovery_pattern"] = latest_attempt.get("current_primary_pattern")
+            diagnostic["historical_breakout_recovery_seed_pattern_matches_current"] = latest_attempt.get("seed_pattern_matches_current")
+            diagnostic["historical_breakout_recovery_candidate_pivot"] = latest_attempt.get("candidate_pivot")
+            diagnostic["historical_breakout_recovery_previous_close"] = latest_attempt.get("previous_close")
+            diagnostic["historical_breakout_recovery_event_close"] = latest_attempt.get("event_close")
+        return dict(state), diagnostic
+
+    recovered = events[-1]
+    current_date = _date_string(state.get("breakout_date"))
+    recovered_date = str(recovered["event_date"])
+    current_pivot = _num(state.get("breakout_pivot"))
+    should_apply = current_pivot is None or current_date is None or recovered_date >= current_date
+    if not should_apply:
+        diagnostic.update({
+            "historical_breakout_recovery_reason": "CURRENT_REPLAY_HAS_NEWER_BREAKOUT",
+            "historical_breakout_recovery_attempted_event_date": recovered_date,
+            "historical_breakout_recovery_pattern": recovered.get("pattern"),
+            "historical_breakout_recovery_seed_pattern": recovered.get("seed_pattern"),
+            "historical_breakout_recovery_seed_pattern_matches_current": recovered.get("seed_pattern_matches_current"),
+            "historical_breakout_recovery_candidate_pivot": recovered.get("candidate_pivot"),
+            "historical_breakout_recovery_previous_close": recovered.get("previous_close"),
+            "historical_breakout_recovery_event_close": recovered.get("event_close"),
+        })
+        return dict(state), diagnostic
+
+    reconciled = dict(state)
+    # Recalculate the numeric pivot from current OHLC; never resurrect the prior
+    # active cycle or overwrite the current pattern/rebase state from the ledger.
+    reconciled["breakout_pivot"] = float(recovered["candidate_pivot"])
+    reconciled["breakout_date"] = recovered_date
+    diagnostic.update({
+        "historical_breakout_recovered": True,
+        "historical_breakout_recovery_pattern": recovered["pattern"],
+        "historical_breakout_recovery_event_date": recovered_date,
+        "historical_breakout_recovery_reason": "SEED_EVENT_REVALIDATED_ON_CURRENT_OHLC",
+        "historical_breakout_recovery_seed_pattern": recovered.get("seed_pattern"),
+        "historical_breakout_recovery_seed_pattern_matches_current": recovered.get("seed_pattern_matches_current"),
+        "historical_breakout_recovery_candidate_pivot": recovered.get("candidate_pivot"),
+        "historical_breakout_recovery_previous_close": recovered.get("previous_close"),
+        "historical_breakout_recovery_event_close": recovered.get("event_close"),
+        "historical_breakout_recovery_attempted_event_date": recovered_date,
+    })
+    return reconciled, diagnostic
 
 def _num(value: Any) -> float | None:
     try:
@@ -167,6 +430,16 @@ def analyze_symbol(
     state, provenance = _history_snapshot(
         ticker, bars, None if has_separate_adjusted_close else seed_snapshot
     )
+    recovery_diagnostic = {
+        "historical_breakout_recovered": False,
+        "historical_breakout_recovery_pattern": None,
+        "historical_breakout_recovery_event_date": None,
+        "historical_breakout_recovery_reason": "NOT_REQUESTED",
+    }
+    if has_separate_adjusted_close and provenance == "ROLLING_300_BAR_REPLAY":
+        state, recovery_diagnostic = _reconcile_historical_breakout(
+            ticker, bars, dict(state), provenance
+        )
     last = bars.iloc[-1]
     previous = bars.iloc[-2] if len(bars) > 1 else None
     close = float(last["Close"])
@@ -274,6 +547,7 @@ def analyze_symbol(
         "rebase_secondary_reasons": (None if state.get("rebase_secondary_reasons") is None or pd.isna(state.get("rebase_secondary_reasons")) else str(state.get("rebase_secondary_reasons"))),
         "breakout_date": _date_string(state.get("breakout_date")),
         "breakout_cycle_active": bool(state.get("breakout_cycle_active", False)),
+        **recovery_diagnostic,
         "breakout_event": bool(state.get("breakout_event", False)),
         "breakout_failure": bool(state.get("breakout_failure", False)),
         "rvol": _pct(rvol),
