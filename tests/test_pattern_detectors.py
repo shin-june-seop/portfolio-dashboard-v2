@@ -254,3 +254,60 @@ def test_base_on_base_handles_candidate_ends_before_first_breakout_without_crash
     event_date = pd.Timestamp(frame.iloc[-1]["Date"]).date()
     result = detect_base_on_base(frame, prior_breakout_pivot=100, prior_breakout_date=event_date)
     assert result is None
+
+
+def _historical_ohlcv_window(symbol: str, as_of: str, bars: int = 120):
+    """Load the checked-in historical OHLCV fixture, bounded to an as-of date."""
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "data" / "regression" / "ohlcv" / f"{symbol}.csv"
+    frame = pd.read_csv(path, parse_dates=["Date"])
+    frame = frame.loc[frame["Date"] <= pd.Timestamp(as_of)].tail(bars).reset_index(drop=True)
+    assert len(frame) >= 30, f"Insufficient historical fixture for {symbol} at {as_of}"
+    return frame
+
+
+def test_historical_stx_cup_without_handle_false_positive_is_rejected():
+    # At 2026-09-21 STX's candidate window contains a material interior spike
+    # above the proposed rims and an 18% pullback after the selected cup low.
+    # Neither condition is visible to the old post-right-rim-only guard.
+    frame = _historical_ohlcv_window("STX", "2026-09-21")
+    result = detect_cup_without_handle(frame)
+    assert result is None
+
+
+def test_historical_stx_spiky_cup_is_not_relabelled_as_cup_handle():
+    # At 2026-09-25 the old detector re-used the same unstable July/August cup
+    # geometry to label a Cup & Handle after Cup Without Handle was rejected.
+    # The shared cup-body quality checks must prevent that relabeling.
+    frame = _historical_ohlcv_window("STX", "2026-09-25")
+    assert detect_cup_handle(frame) is None
+
+
+def test_historical_amat_cup_without_handle_positive_control_is_preserved():
+    # Keep the manually reviewed borderline-but-plausible cup as a positive control.
+    frame = _historical_ohlcv_window("AMAT", "2026-09-29")
+    result = detect_cup_without_handle(frame)
+    assert result is not None
+    assert result.pattern_name == "Cup Without Handle"
+    assert result.pattern_start_date == date(2026, 8, 14)
+    assert abs(result.candidate_pivot - 539.2334) < 0.02
+    assert result.diagnostics["max_right_side_pullback_pct"] <= 6.0
+    assert result.diagnostics["interior_high_above_rim_pct"] == 0.0
+
+
+def test_cup_without_handle_rejects_deep_pullback_before_right_rim():
+    # A rounded cup can appear to have matching rims, yet a large pullback on the
+    # recovery path before the late right rim makes it unstable / handle-like.
+    frame = cup_without_handle_fixture()
+    changes = {
+        38: (97.0, 99.0, 95.0),
+        41: (85.0, 87.0, 82.0),
+        42: (82.0, 84.0, 79.0),
+        43: (85.0, 88.0, 82.0),
+        44: (90.0, 92.0, 88.0),
+        45: (94.0, 96.0, 92.0),
+    }
+    for idx, (close, high, low) in changes.items():
+        frame.loc[idx, ["Open", "High", "Low", "Close"]] = [close, high, low, close]
+    assert detect_cup_without_handle(frame) is None

@@ -48,29 +48,38 @@ def test_amat_valid_pattern_ends_rebase_and_later_drawdown_starts_a_new_cycle():
     assert low["rebase_low_date"] == "2026-10-16"
 
 
-def test_stx_candidate_breakout_failure_and_rebase_are_distinct_events():
-    candidate = _row("STX", "2026-09-21")
-    assert not bool(candidate["rebase_active"])
-    assert candidate["pattern"] == "Cup Without Handle"
-    assert candidate["candidate_pivot"] == pytest.approx(921.041716, abs=0.02)
+def test_stx_spiky_cup_candidate_is_rejected_before_it_creates_a_false_breakout_cycle():
+    # Manual chart review found a material interior spike and an ~18% pullback on
+    # the right-side recovery path. Neither cup detector should create the old
+    # Sep-21 candidate or the consequent Sep-23 breakout / Sep-24 failure events.
+    for day in (
+        "2026-09-21", "2026-09-22", "2026-09-23", "2026-09-24",
+        "2026-09-25", "2026-09-28", "2026-09-29", "2026-09-30",
+    ):
+        row = _row("STX", day)
+        assert bool(row["rebase_active"])
+        assert row["pattern"] == "BASE FORMING / NO VALID PATTERN"
+        assert pd.isna(row["candidate_pivot"])
+        assert not bool(row["breakout_event"])
+        assert not bool(row["breakout_failure"])
+        assert not bool(row["breakout_cycle_active"])
 
-    breakout = _row("STX", "2026-09-23")
-    assert bool(breakout["breakout_event"])
-    assert breakout["stage"] == "BREAKOUT"
-    assert bool(breakout["breakout_cycle_active"])
 
-    failure = _row("STX", "2026-09-24")
-    assert bool(failure["breakout_failure"])
-    assert failure["stage"] == "BREAKOUT FAILURE"
-    assert bool(failure["rebase_active"])
-    assert failure["rebase_reason"] == "BREAKOUT_FAILURE"
-    assert failure["breakout_pivot"] == pytest.approx(921.041716, abs=0.02)
-    assert not bool(failure["breakout_cycle_active"])
+def test_bundled_seed_reflects_corrected_stx_pattern_history():
+    # The app starts incremental replay from this file, so update the seed after
+    # rejecting the historical false cup; otherwise old pivot/cycle state persists.
+    from dashboard_v2.services.screening_service import load_seed_snapshots
 
-    later_low = _row("STX", "2026-10-16")
-    assert later_low["rebase_started_at"] == "2026-09-24"
-    assert later_low["rebase_low"] == pytest.approx(636.359985, abs=0.02)
-    assert later_low["rebase_low_date"] == "2026-10-16"
+    seed = load_seed_snapshots().get("STX")
+    assert seed is not None
+    assert pd.Timestamp(seed["as_of_date"]).date().isoformat() == "2026-10-19"
+    assert seed["breakout_pivot"] == pytest.approx(861.344931, abs=0.02)
+    assert seed["breakout_date"] == "2026-05-27"
+    assert bool(seed["rebase_active"])
+    assert seed["rebase_started_at"] == "2026-10-02"
+    assert seed["rebase_reason"] == "CANDIDATE_PIVOT_DRAWDOWN"
+    assert pd.isna(seed["candidate_pivot"])
+    assert not bool(seed["breakout_cycle_active"])
 
 
 def test_active_rebase_suppresses_breakout_stage_except_failure_event():

@@ -204,6 +204,43 @@ def _cup_shape(s: pd.DataFrame, *, min_depth: float, max_depth: float, rim_toler
                              rim_tolerance=rim_tolerance)
 
 
+def _cup_path_quality(high: np.ndarray, low: np.ndarray, shape: dict) -> dict | None:
+    """Validate the full cup body, not just the selected rim and final bars.
+
+    A cup's selected rims should bound the formation, and the recovery path after
+    the central trough should not contain a handle-sized collapse before the rim
+    is established. The same structural guard is shared by Cup & Handle and Cup
+    Without Handle so a weak cup cannot be re-labelled as the other variant.
+    """
+    left_idx = int(shape["left_idx"])
+    trough_idx = int(shape["trough_idx"])
+    right_idx = int(shape["right_idx"])
+    rim_level = max(float(shape["left_rim"]), float(shape["right_rim"]))
+
+    interior = high[left_idx + 1:right_idx]
+    max_interior_high = float(np.max(interior)) if len(interior) else rim_level
+    interior_high_above_rim_pct = max(0.0, (max_interior_high / rim_level - 1.0) * 100.0)
+    if max_interior_high > rim_level * (1.0 + PS.cup_rim_tolerance):
+        return None
+
+    recovery_highs = high[trough_idx + 1:]
+    recovery_lows = low[trough_idx + 1:]
+    if len(recovery_highs):
+        running_peaks = np.maximum.accumulate(recovery_highs)
+        max_right_side_pullback = float(
+            np.max((running_peaks - recovery_lows) / running_peaks)
+        )
+    else:
+        max_right_side_pullback = 0.0
+    if max_right_side_pullback > PS.cup_without_handle_max_rim_pullback:
+        return None
+
+    return {
+        "interior_high_above_rim_pct": round(interior_high_above_rim_pct, 2),
+        "max_right_side_pullback_pct": round(max_right_side_pullback * 100.0, 2),
+    }
+
+
 def detect_cup_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
@@ -217,9 +254,14 @@ def detect_cup_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | No
                 continue
             for handle_len in range(PS.cup_handle_min_bars, min(PS.cup_handle_max_bars, total_len - PS.cup_min_bars) + 1):
                 cup_end = end - handle_len
-                shape = _cup_shape_arrays(highs[start:cup_end + 1], lows[start:cup_end + 1],
+                cup_highs = highs[start:cup_end + 1]
+                cup_lows = lows[start:cup_end + 1]
+                shape = _cup_shape_arrays(cup_highs, cup_lows,
                                           min_depth=PS.cup_handle_min_depth, max_depth=PS.cup_handle_max_depth)
                 if shape is None:
+                    continue
+                cup_quality = _cup_path_quality(cup_highs, cup_lows, shape)
+                if cup_quality is None:
                     continue
                 handle_high = float(np.max(highs[cup_end + 1:end + 1]))
                 handle_low = float(np.min(lows[cup_end + 1:end + 1]))
@@ -235,7 +277,8 @@ def detect_cup_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | No
                                                "handle_depth_pct": round(depth * 100, 2),
                                                "handle_bars": handle_len,
                                                "left_rim": shape["left_rim"],
-                                               "right_rim": shape["right_rim"]})
+                                               "right_rim": shape["right_rim"],
+                                               **cup_quality})
     return None
 
 
@@ -251,9 +294,20 @@ def detect_cup_without_handle(frame: pd.DataFrame, *, rebase_started_at: date | 
             shape = _cup_shape(s, min_depth=PS.cup_without_handle_min_depth, max_depth=PS.cup_without_handle_max_depth)
             if shape is None:
                 continue
-            # A meaningful pullback from the recovered right rim is a handle candidate;
-            # those should be scored by the dedicated Cup & Handle detector instead.
-            post_rim_lows = s.iloc[shape["right_idx"]:]["Low"]
+            # Validate all highs and the entire recovery path, not just lows that
+            # occur after the selected right rim. This blocks unstable cup bodies.
+            highs = s["High"].to_numpy(float)
+            lows = s["Low"].to_numpy(float)
+            cup_quality = _cup_path_quality(highs, lows, shape)
+            if cup_quality is None:
+                continue
+            right_idx = int(shape["right_idx"])
+            max_right_side_pullback = float(cup_quality["max_right_side_pullback_pct"])
+            interior_high_above_rim_pct = float(cup_quality["interior_high_above_rim_pct"])
+
+            # Keep the explicit post-rim guard as a readable invariant: any substantial
+            # pullback after the right rim belongs to Cup & Handle, not Cup Without Handle.
+            post_rim_lows = s.iloc[right_idx:]["Low"]
             right_peak = shape["right_rim"]
             pullback = (right_peak - float(post_rim_lows.min())) / right_peak
             if pullback > PS.cup_without_handle_max_rim_pullback:
@@ -266,7 +320,9 @@ def detect_cup_without_handle(frame: pd.DataFrame, *, rebase_started_at: date | 
                               diagnostics={"cup_depth_pct": round(shape["depth"] * 100, 2),
                                            "duration_bars": length,
                                            "left_rim": shape["left_rim"],
-                                           "right_rim": shape["right_rim"]})
+                                           "right_rim": shape["right_rim"],
+                                           "interior_high_above_rim_pct": round(interior_high_above_rim_pct, 2),
+                                           "max_right_side_pullback_pct": round(max_right_side_pullback, 2)})
     return None
 
 
