@@ -89,6 +89,17 @@ def replay_symbol(
         if process_cutoff is not None and asof <= process_cutoff:
             continue
         close = float(bar["Close"])
+        # Keep replay-stage confirmation consistent with the canonical screen RVOL:
+        # current completed-bar volume divided by the mean volume of the prior 20
+        # completed bars (excluding today's volume). Without this input, the replay
+        # could emit BREAKOUT but could never emit BREAKOUT CONFIRMED.
+        prior_volumes = history["Volume"].iloc[-21:-1] if len(history) >= 21 else pd.Series(dtype=float)
+        avg_prior_volume = float(prior_volumes.mean()) if len(prior_volumes) == 20 else None
+        eod_rvol = (
+            float(bar["Volume"]) / avg_prior_volume
+            if avg_prior_volume is not None and avg_prior_volume > 0
+            else None
+        )
         prior_candidate = candidate_pivot
         prior_breakout = breakout_pivot
         prior_breakout_active = breakout_active
@@ -184,6 +195,7 @@ def replay_symbol(
             breakout_cycle_active=breakout_active,
             next_pivot=active_candidate_pivot,
             next_pivot_valid=active_candidate_pivot is not None,
+            eod_rvol=eod_rvol,
         ))
 
         if stage.breakout_failure:
@@ -223,6 +235,7 @@ def replay_symbol(
             "as_of_date": asof.isoformat(),
             "open": float(bar["Open"]), "high": float(bar["High"]),
             "low": float(bar["Low"]), "close": close, "volume": int(bar["Volume"]),
+            "eod_rvol": eod_rvol,
             "pattern": pattern_name,
             "pattern_start_date": candidate_start.isoformat() if candidate_start else None,
             "candidate_pivot": candidate_pivot,
@@ -237,6 +250,7 @@ def replay_symbol(
             "rebase_reason": rebase_state.primary_reason,
             "rebase_secondary_reasons": "|".join(rebase_state.secondary_reasons),
             "breakout_event": stage.breakout_event,
+            "breakout_confirmed": stage.breakout_confirmed,
             "breakout_failure": stage.breakout_failure,
             "prior_candidate_pivot": prior_candidate,
             "prior_breakout_pivot": prior_breakout,
