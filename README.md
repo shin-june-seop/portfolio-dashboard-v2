@@ -13,7 +13,7 @@ Implemented and unit-tested:
 - Synthetic-fixture tests for detector geometry and rebase boundary handling.
 - Yahoo Finance daily-bar adapter with a 16:15 ET finalization buffer, XNYS session freshness checks, split-normalized technical OHLC, and separate dividend/split-adjusted Adj Close for holding-period returns.
 - Momentum Monitor and Pattern Scanner connected to one shared analysis service with candidate/breakout pivot distances, 20D reference, official EOD stage, rebase state, RVOL, returns, and optional relative strength vs SPY.
-- Incremental chronological replay from the seven bundled state snapshots when the historical close matches; unseeded symbols use a clearly labelled rolling 260-bar replay.
+- Incremental chronological replay from the seven bundled state snapshots when the historical close matches; unseeded symbols use a clearly labelled rolling 300-bar replay.
 - Local historical OHLCV capture utility and a regression runner that differentiates observed output from chart-labelled PASS/FAIL.
 - Static Supabase call-site inventory from legacy source; live schema/RLS not inspected.
 
@@ -113,4 +113,4 @@ Deploy this repository/project folder with `app.py` as the entry point. Cloud in
 
 ### Historical state note
 
-The historical fixture mode can use its matching bundled replay snapshot. Yahoo EOD bars use a separate split-normalized OHLC basis, so they intentionally do not resume the legacy auto-adjusted seed; they use a transparent rolling 260-bar replay. For those symbols, older breakout history beyond the window may not be reconstructed. All bundled states remain engine-generated starting states, not independently labelled ground truth.
+The historical fixture mode can use its matching bundled replay snapshot. Yahoo EOD bars use a separate split-normalized OHLC basis, so they intentionally do not resume the legacy auto-adjusted seed; they use a transparent rolling 300-bar replay. For those symbols, older breakout history beyond the window may not be reconstructed. All bundled states remain engine-generated starting states, not independently labelled ground truth.

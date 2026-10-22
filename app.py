@@ -110,7 +110,7 @@ def _render_scan_table(frame: pd.DataFrame, *, pattern_mode: bool = False):
     view["상태 출처"] = view["replay_provenance"].map({
         "BUNDLED_REPLAY_SNAPSHOT": "번들 스냅샷",
         "INCREMENTAL_FROM_BUNDLED_SNAPSHOT": "스냅샷 이후 증분 재생",
-        "ROLLING_260_BAR_REPLAY": "최근 260봉 재생",
+        "ROLLING_300_BAR_REPLAY": "최근 300봉 재생",
     }).fillna(view["replay_provenance"])
     cols = ["ticker", "기준일", "가격", "일간 %", "패턴", "후보 피봇", "후보 거리", "돌파 피봇", "돌파 거리", "20D Ref", "Stage", "재베이스", "RVOL", "3개월 수익률", "SPY 대비 RS(3M)"]
     if pattern_mode:
@@ -213,7 +213,7 @@ if page in {"Momentum Monitor", "Pattern Scanner"}:
             k4.metric("계산 시간", f"{elapsed:.1f}s")
             if source == "Yahoo Finance (EOD)":
                 st.warning("Yahoo Finance는 외부 공급원이며 과거 데이터가 정정될 수 있습니다. 이 화면은 읽기 전용 분석이며 자동 주문을 제출하지 않습니다.")
-            if result["replay_provenance"].eq("ROLLING_260_BAR_REPLAY").any():
+            if result["replay_provenance"].eq("ROLLING_300_BAR_REPLAY").any():
                 st.warning("Yahoo EOD는 새 auto_adjust=False OHLC 기준을 사용하므로, 과거 auto_adjust=True 스냅샷과 혼합하지 않고 최근 260봉을 재생합니다. 이 구간보다 오래된 Breakout Pivot 이력은 재구성되지 않을 수 있습니다.")
             if result["validation_status"].eq("OBSERVED_NOT_VALIDATED").any():
                 st.caption("엔진 출력은 관측 결과이며, 별도 라벨링된 정답 차트와 대조되지 않은 항목은 검증 완료로 간주하지 않습니다.")

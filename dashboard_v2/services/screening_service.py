@@ -136,14 +136,15 @@ def _history_snapshot(symbol: str, bars: pd.DataFrame, seed: dict[str, Any] | No
             return replay.iloc[-1].to_dict(), "INCREMENTAL_FROM_BUNDLED_SNAPSHOT"
         return dict(seed), "BUNDLED_REPLAY_SNAPSHOT"
 
-    # For symbols without a compatible seed, use a transparent 260-bar rolling
-    # replay. This is enough for the current detector set but is not a full
-    # multi-year reconstruction of older breakout events.
-    rolling = bars.tail(260).reset_index(drop=True)
+    # For symbols without a compatible seed, use a transparent 300-bar rolling
+    # replay. The extra warm-up context is required to reconstruct current
+    # Base-on-Base patterns whose first-base breakout precedes the normal
+    # 120-bar detector window. This still is not a full multi-year history.
+    rolling = bars.tail(300).reset_index(drop=True)
     replay = replay_symbol(symbol, rolling)
     if replay.empty:
         return {}, "NO_REPLAY_RESULT"
-    return replay.iloc[-1].to_dict(), "ROLLING_260_BAR_REPLAY"
+    return replay.iloc[-1].to_dict(), "ROLLING_300_BAR_REPLAY"
 
 
 def analyze_symbol(
@@ -160,7 +161,7 @@ def analyze_symbol(
         raise ValueError(f"No daily bars available for {ticker}")
     # The current Yahoo policy supplies split-normalized OHLC plus a separate
     # adjusted close. Do not resume a state snapshot built on dividend-adjusted
-    # OHLC; use the transparent 260-bar replay instead to avoid mixed price bases.
+    # OHLC; use the transparent 300-bar replay instead to avoid mixed price bases.
     has_separate_adjusted_close = _adjusted_close_column(raw_bars) is not None
     return_close, return_price_basis = _aligned_return_close(raw_bars, bars)
     state, provenance = _history_snapshot(

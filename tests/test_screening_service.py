@@ -1,5 +1,6 @@
 from pathlib import Path
 import pandas as pd
+import pytest
 
 from dashboard_v2.services.screening_service import analyze_symbol, load_seed_snapshots
 
@@ -26,7 +27,7 @@ def test_analyze_symbol_returns_shared_screen_contract():
     ):
         assert key in result
     assert result["ticker"] == "TEST"
-    assert result["replay_provenance"] == "ROLLING_260_BAR_REPLAY"
+    assert result["replay_provenance"] == "ROLLING_300_BAR_REPLAY"
     assert result["twenty_day_reference"] is not None
 
 
@@ -162,5 +163,32 @@ def test_adjusted_ohlc_input_does_not_resume_legacy_price_basis_seed():
         "rebase_active": False,
     }
     result = analyze_symbol("TEST", bars, seed_snapshot=seed)
-    assert result["replay_provenance"] == "ROLLING_260_BAR_REPLAY"
+    assert result["replay_provenance"] == "ROLLING_300_BAR_REPLAY"
     assert result["technical_price_basis"] == "YAHOO_OHLC_AUTO_ADJUST_FALSE"
+
+
+def test_yahoo_basis_rolling_replay_reconstructs_recent_base_on_base_context():
+    """The raw-OHLC replay needs enough warm-up bars for the first breakout context.
+
+    Without a compatible legacy snapshot, 260 bars began too late to reconstruct
+    GOOG's first-base breakout and consequently left a still-valid recent
+    Base-on-Base candidate hidden behind a false rebase state. 300 bars restores
+    the current pattern without resuming the incompatible adjusted-OHLC snapshot.
+    """
+    root = Path(__file__).resolve().parents[1]
+    bars = pd.read_csv(root / "data" / "regression" / "ohlcv" / "GOOG.csv")
+    # Presence of Adj Close selects the same no-legacy-seed path as Yahoo EOD.
+    # The bundled fixture's Close is already adjusted, so reusing it here is only
+    # a replay-window regression test, not a live-provider adjustment validation.
+    bars["Adj Close"] = bars["Close"]
+    seeds = load_seed_snapshots(root / "data" / "regression" / "chronological_replay.csv")
+
+    result = analyze_symbol("GOOG", bars, seed_snapshot=seeds["GOOG"])
+
+    assert result["replay_provenance"] == "ROLLING_300_BAR_REPLAY"
+    assert result["pattern"] == "Base-on-Base"
+    assert result["detected_pattern_diagnostic"] == "Base-on-Base"
+    assert result["pattern_start_date"] == "2026-09-11"
+    assert result["candidate_pivot"] == pytest.approx(359.9800109863281)
+    assert result["breakout_pivot"] == pytest.approx(329.89447335434147)
+    assert result["rebase_active"] is False

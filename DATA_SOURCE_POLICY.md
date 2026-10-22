@@ -22,7 +22,7 @@
 ## 3. Seed and historical fixture compatibility
 
 - The bundled OHLCV CSVs and chronological replay snapshot were captured with the earlier `auto_adjust=True` total-return-adjusted OHLC basis. They remain available for the explicit “Bundled regression data (historical)” mode; there `Close` is already adjusted and is used as the return series when no separate `Adj Close` column exists.
-- Yahoo's new split-normalized OHLC plus separate `Adj Close` basis is not mixed with the old seed state. When separate `Adj Close` is present, analysis intentionally avoids resuming the legacy basis snapshot and uses a transparent rolling 260-bar replay. The UI warns that events older than this window may not be reconstructed. This avoids silently comparing pivots from different price bases.
+- Yahoo's new split-normalized OHLC plus separate `Adj Close` basis is not mixed with the old seed state. When separate `Adj Close` is present, analysis intentionally avoids resuming the legacy basis snapshot and uses a transparent rolling 300-bar replay. The UI warns that events older than this window may not be reconstructed. This avoids silently comparing pivots from different price bases.
 - The current close can still match a legacy seed within tolerance while historical pivots differ due to dividend adjustment; close-only compatibility is therefore insufficient to establish basis compatibility.
 
 ## 4. Failure behavior and operational boundary
