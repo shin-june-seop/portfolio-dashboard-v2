@@ -88,10 +88,12 @@ def audit_symbol(symbol: str, csv_path: Path, metadata: dict[str, Any] | None = 
                 result["metadata_row_match"] = "NO_OK_METADATA"
                 warnings.append("No successful metadata record for this ticker")
 
-        if metadata and metadata.get("auto_adjust") is True:
-            warnings.append("auto_adjust=true: verify this price basis matches old dashboard/journal before numeric pivot comparisons")
+        if metadata and metadata.get("technical_price_basis") == "YAHOO_OHLC_AUTO_ADJUST_FALSE":
+            warnings.append("OHLC is the technical price basis; use the separate Adj Close field only for holding-period returns/RS")
+        elif metadata and metadata.get("auto_adjust") is True:
+            warnings.append("legacy auto_adjust=true data: OHLC includes dividend adjustment; do not mix pivot values with split-normalized OHLC without reconciliation")
         elif metadata and metadata.get("auto_adjust") is False:
-            warnings.append("auto_adjust=false: verify split/dividend adjustment compatibility before numeric pivot comparisons")
+            warnings.append("auto_adjust=false metadata lacks the approved technical/return price-basis contract; review before numeric pivot comparisons")
 
     except Exception as exc:
         result.update(status="AUDIT_ERROR", issues=f"{type(exc).__name__}: {exc}")
@@ -120,7 +122,7 @@ def main() -> int:
         "symbols_checked": len(results), "status_counts": status_counts,
         "all_files_present": all(r["status"] not in {"MISSING_FILE", "EMPTY", "INVALID_DATA", "AUDIT_ERROR"} for r in results),
         "all_rows_match_capture_metadata": all(r["metadata_row_match"] == "MATCH" for r in results),
-        "important": "REVIEW warnings are not failures. This audit checks data consistency, not provider correctness or adjustment-policy approval.",
+        "important": "REVIEW warnings are not failures. This audit checks data consistency and basis metadata, not whether detected patterns match independently labelled ground truth.",
         "details_file": str(rows_path),
     }
     summary_path = args.output_dir / "ohlcv_audit_summary.json"

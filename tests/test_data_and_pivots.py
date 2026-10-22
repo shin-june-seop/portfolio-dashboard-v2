@@ -60,3 +60,10 @@ def test_market_bar_date_calendar_day_is_not_shifted_by_timezone_normalization()
     }])
     out = normalize_ohlcv(df)
     assert out.iloc[0]["Date"].date() == date(2026, 10, 19)
+
+
+def test_normalize_rejects_non_finite_ohlcv_values():
+    df = bars_from_closes([100.0, 101.0, 102.0])
+    df.loc[2, "Volume"] = float("inf")
+    with pytest.raises(MarketDataError, match="non-finite"):
+        normalize_ohlcv(df)

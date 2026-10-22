@@ -11,7 +11,7 @@ Run these commands from the project root (`portfolio_dashboard_v2`):
 .\.venv\Scripts\python.exe tools/capture_historical_ohlcv.py
 ```
 
-This creates one file per ticker in `ohlcv/` and a `capture_metadata.json`. The provider/price-adjustment policy is a candidate only. Verify it before comparing exact numeric levels. Then complete the manifest and run:
+This creates one file per ticker in `ohlcv/` and a `capture_metadata.json`. Captured technical OHLC follows `auto_adjust=False`; `Adj Close` is retained separately for returns/RS. The latest expected XNYS session must be present. This is a fixed policy but the third-party source may revise data. Complete the manifest with independent chart labels and run:
 
 ```powershell
 .\.venv\Scripts\python.exe tools/run_historical_regression.py

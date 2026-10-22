@@ -7,7 +7,7 @@ The functional specification is `Dashboard_V2_Functional_Spec_v0.12.md`. This pr
 ## 2. Data flow
 
 ```text
-Price provider adapter (not selected yet)
+Yahoo Finance EOD adapter (explicitly selected by user)
           ↓  completed daily bars + explicit as_of_date
 MarketDataService → normalize_ohlcv / data-quality validation
           ↓
@@ -28,7 +28,7 @@ Streamlit pages (display only; no inline trading rules)
 
 - `models/schemas.py`: shared types and enums. Cross-screen state fields belong here instead of local ad-hoc dictionaries.
 - `config/settings.py`: tunable thresholds adopted from the spec. Rule changes require spec + config + tests to change together.
-- `engines/data_validation.py`: canonical OHLCV contract. It does not guess the final bar is incomplete and never drops it silently.
+- `engines/data_validation.py`: canonical OHLCV contract, including finite-value checks. The provider verifies the latest expected XNYS session before any signal is calculated.
 - `engines/pattern_engine.py`: shared detector-output contract and single primary-pattern choice (VCP first, then spec priority).
 - `engines/pattern_detectors.py`: initial pure OHLCV detectors for nine pattern/setup types. Thresholds are centralized in `config/settings.py`; synthetic fixtures test their intended geometry.
 - `engines/pivot_engine.py`: pivot distance, approach gate, rolling 20-bar high reference.
@@ -38,16 +38,16 @@ Streamlit pages (display only; no inline trading rules)
 - `engines/risk_engine.py`: per-fill initial stop, monotonic trailing-stop updates, high-watermark reconstruction support, and EOD-only signal output. No order or position mutation.
 - `engines/pocket_pivot_engine.py`: strict prior-10-down-day volume comparison, MA support/reclaim, explicit wider context gate.
 - `repositories/supabase_repository.py`: optional read-only boundary. There are no insert/update/delete/upsert/RPC methods. It will not connect unless explicitly enabled.
-- `services/market_data_service.py`: canonical provider boundary; no provider is wired in by default.
-- `services/yfinance_provider.py`: optional candidate adapter that mirrors the main legacy daily-bar path for parity tests; provider/adjustment/bar-finalization policy is not approved for production.
+- `services/market_data_service.py`: canonical provider boundary; preserves a separate `Adj Close` series when supplied.
+- `services/yfinance_provider.py`: Yahoo EOD adapter using `auto_adjust=False` OHLC for technical analysis, separate `Adj Close` for total-return metrics, XNYS expected-session checking, and a 16:15 ET finalization cutoff.
 - `app.py`: presentation only. No trading state is calculated inside Streamlit pages.
 
 ## 4. Decisions intentionally not guessed yet
 
-1. Final provider, split/dividend-adjustment policy, exchange calendar, and definition of a completed bar. The yfinance adapter is a candidate only.
+1. Yahoo is approved for V2 EOD analysis under `DATA_SOURCE_POLICY.md`; historical pattern-label validation remains incremental. The source can revise data and must fail closed on missing/stale bars.
 2. Live Supabase tables, fields, unique constraints, views, RPC functions, RLS policies, triggers, and exact write paths; static source inventory is available but is not live-schema validation.
 3. Actual widget/action inventory for each retained legacy page.
-4. Historical chart-pattern recognition/false-positive validation: synthetic fixtures exist and a regression harness is implemented, but real AMAT/MU/SOXX/META/GOOG/STX dates and chart-labelled expected results are still pending.
+4. Historical chart-pattern recognition/false-positive validation is ongoing; representative AMAT/MU/SOXX/META/GOOG/STX cases have been reviewed, but the full universe does not have independent chart-labelled ground truth.
 5. Core/Satellite storage scope and any schema migration.
 
 ## 5. Failure and idempotency rules

@@ -109,3 +109,58 @@ def test_secondary_pattern_diagnostic_uses_same_windowed_breakout_context():
     result = analyze_symbol("GOOG", bars, seed_snapshot=seed_map["GOOG"])
     assert result["pattern"] == "Base-on-Base"
     assert result["detected_pattern_diagnostic"] == result["pattern"]
+
+
+def test_holding_period_returns_and_rs_use_adjusted_close_not_technical_close():
+    bars = _bars(300)
+    # Mimic dividends: the adjusted total-return series has a different historic
+    # adjustment factor from the split-normalized technical OHLC Close series.
+    factors = pd.Series([0.92 + 0.08 * i / (len(bars) - 1) for i in range(len(bars))])
+    bars["Adj Close"] = bars["Close"] * factors
+    benchmark = _bars(300)
+    benchmark["Adj Close"] = benchmark["Close"] * pd.Series(
+        [0.96 + 0.04 * i / (len(benchmark) - 1) for i in range(len(benchmark))]
+    )
+
+    result = analyze_symbol("TEST", bars, benchmark_bars=benchmark)
+    expected_3m = (bars["Adj Close"].iloc[-1] / bars["Adj Close"].iloc[-64] - 1) * 100
+    close_based_3m = (bars["Close"].iloc[-1] / bars["Close"].iloc[-64] - 1) * 100
+    expected_symbol_return = bars["Adj Close"].iloc[-1] / bars["Adj Close"].iloc[-64] - 1
+    expected_benchmark_return = benchmark["Adj Close"].iloc[-1] / benchmark["Adj Close"].iloc[-64] - 1
+    expected_rs = (expected_symbol_return - expected_benchmark_return) * 100
+
+    assert result["return_3m_pct"] == round(expected_3m, 2)
+    assert result["return_3m_pct"] != round(close_based_3m, 2)
+    assert result["rs_3m_vs_spy_pct"] == round(expected_rs, 2)
+    assert result["return_price_basis"] == "YAHOO_ADJ_CLOSE_SPLIT_AND_DISTRIBUTION_ADJUSTED"
+    assert result["technical_price_basis"] == "YAHOO_OHLC_AUTO_ADJUST_FALSE"
+
+
+def test_adjusted_close_gaps_fail_closed_instead_of_fabricating_returns():
+    bars = _bars(70)
+    bars["Adj Close"] = bars["Close"]
+    bars.loc[10, "Adj Close"] = float("nan")
+    try:
+        analyze_symbol("TEST", bars)
+    except ValueError as exc:
+        assert "Adjusted Close" in str(exc)
+    else:
+        raise AssertionError("Missing adjusted-close row should fail closed")
+
+
+def test_adjusted_ohlc_input_does_not_resume_legacy_price_basis_seed():
+    bars = _bars(70)
+    bars["Adj Close"] = bars["Close"] * 0.99
+    seed = {
+        "ticker": "TEST",
+        "as_of_date": pd.Timestamp(bars.iloc[-1]["Date"]).date().isoformat(),
+        "close": float(bars.iloc[-1]["Close"]),
+        "breakout_pivot": 90.0,
+        "breakout_date": "2026-01-15",
+        "breakout_cycle_active": False,
+        "stage": "BASE",
+        "rebase_active": False,
+    }
+    result = analyze_symbol("TEST", bars, seed_snapshot=seed)
+    assert result["replay_provenance"] == "ROLLING_260_BAR_REPLAY"
+    assert result["technical_price_basis"] == "YAHOO_OHLC_AUTO_ADJUST_FALSE"

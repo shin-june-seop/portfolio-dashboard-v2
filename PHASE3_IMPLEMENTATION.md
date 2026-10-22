@@ -1,11 +1,11 @@
 # Phase 3 Implementation — Historical Regression and Data Boundaries
 
 **Spec baseline:** `Dashboard_V2_Functional_Spec_v0.12.md`  
-**Status:** local regression harness and candidate provider adapter implemented; real chart ground truth and production data policy remain unapproved.
+**Status:** local regression harness implemented; V2 EOD data policy approved on 2026-10-22. Broad independent chart ground truth remains incomplete.
 
 ## Delivered
 
-1. **Opt-in yfinance daily adapter** (`dashboard_v2/services/yfinance_provider.py`). It makes explicit daily requests, labels the adjustment setting, normalizes the canonical OHLCV schema, checks for missing/ambiguous fields, and applies a testable US exchange-local completion boundary. The Streamlit app does not connect it automatically.
+1. **Yahoo Finance EOD adapter** (`dashboard_v2/services/yfinance_provider.py`). It requests `auto_adjust=False`, preserves separate `Adj Close`, waits until 16:15 ET, checks the expected XNYS session, and fails closed on missing/stale/incomplete daily data.
 2. **OHLCV capture utility** (`tools/capture_historical_ohlcv.py`). It can save current daily-bar history for AMAT, MU, SOXX, META, GOOG, STX and LRCX as local CSVs and creates `capture_metadata.json` with dates/policy. It never touches Supabase.
 3. **Historical regression runner** (`tools/run_historical_regression.py`). It runs the V2 detector on a given ticker/as-of-date and writes the observed pattern, pivot, pattern start, candidate diagnostics, and status.
 4. **Ground-truth manifest** (`data/regression/manifest.csv`). It contains the known issue scenarios without inventing dates or expected prices. Blank date/expected-label cases are marked pending, not passed.
@@ -47,9 +47,9 @@ Review `data/regression/results.csv`. All expected results must be sourced/label
 
 ## Still not done
 
-- No real historical case is declared passed yet. The user has not supplied exact as-of dates or chart labels for the known failure examples, and the package does not fabricate them.
+- Representative cases have been chart-reviewed, but broad historical chart-labelled ground truth and statistical pattern accuracy are still not complete.
 - No live Supabase schema/columns/keys/RLS were inspected. `docs/legacy_db_inventory/LEGACY_DB_INVENTORY.md` is a static call-site list only.
-- `YFinanceDailyProvider` is not the selected production provider and is not wired to Momentum Monitor.
+- Yahoo Finance is connected to Momentum Monitor/Pattern Scanner for read-only EOD analysis. It remains an external source whose historical bars may be revised.
 - Breakout Pivot/event persistence and trade-entry-time Initial Risk still need integration-level historical acceptance tests after canonical dates/records are assembled.
 
 ## Verification performed on the package

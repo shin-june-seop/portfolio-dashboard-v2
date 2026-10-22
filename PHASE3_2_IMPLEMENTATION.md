@@ -15,7 +15,7 @@
 
 ## Important limits
 
-- The downloaded data remains a candidate source (`yfinance`, `auto_adjust=true`), not formally approved for V2 production.
+- The EOD price policy is now defined in `DATA_SOURCE_POLICY.md`: `auto_adjust=False` technical OHLC plus separate `Adj Close` for total-return metrics. Captured data still needs independent chart labels before it can establish pattern accuracy.
 - The rebase review only approximates RB-01 using price data. OHLCV alone cannot reconstruct historic RB-02 (prior active candidate pivot) or RB-03 (preserved breakout pivot) without the prior dashboard/journal state.
 - The review CSV is not an oracle and cannot produce PASS/FAIL by itself. Human review of historical screenshots/journal/trade records is still required before setting `manifest.csv` expected labels.
 - No Supabase connection, schema mutation, order, or dashboard live-signal activation is introduced.

@@ -1,7 +1,8 @@
-"""Download candidate yfinance bars for manual chart-regression labelling.
+"""Download Yahoo EOD OHLCV plus Adj Close for manual chart-regression review.
 
-This writes local CSVs only. It does not connect to Supabase or enable V2 live
-signals. The provider/adjustment policy is still pending explicit approval.
+This writes local CSVs only. It does not connect to Supabase or submit orders.
+The captured bars follow DATA_SOURCE_POLICY.md and must still be manually
+labelled against independent chart evidence before a case is called validated.
 """
 from __future__ import annotations
 
@@ -24,22 +25,20 @@ def main() -> int:
     parser.add_argument("--symbols", nargs="+", default=list(DEFAULT_SYMBOLS))
     parser.add_argument("--output-dir", type=Path, default=ROOT / "data/regression/ohlcv")
     parser.add_argument("--history-days", type=int, default=5 * 365)
-    parser.add_argument("--auto-adjust", choices=("true", "false"), default="true")
     args = parser.parse_args()
 
-    provider = YFinanceDailyProvider(
-        history_days=args.history_days,
-        auto_adjust=args.auto_adjust == "true",
-    )
+    provider = YFinanceDailyProvider(history_days=args.history_days)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
         "captured_at_utc": datetime.now(timezone.utc).isoformat(),
-        "provider": "yfinance/Yahoo Finance (candidate; not formally approved)",
-        "auto_adjust": args.auto_adjust == "true",
+        "provider": "yfinance/Yahoo Finance (V2 EOD policy; upstream may revise data)",
+        "technical_price_basis": "YAHOO_OHLC_AUTO_ADJUST_FALSE",
+        "return_price_basis": "YAHOO_ADJ_CLOSE_SPLIT_AND_DISTRIBUTION_ADJUSTED",
+        "auto_adjust": False,
         "interval": "1d",
-        "historical_download_policy": "current session excluded before 16:00 America/New_York; explicit replay dates include that historical session",
+        "historical_download_policy": "latest expected XNYS session required; current session withheld until 16:15 America/New_York; explicit historical cutoff must contain the expected prior/current XNYS session",
         "symbols": {},
-        "important": "Review adjustment basis and all OHLCV around each labelled event before using as regression ground truth.",
+        "important": "OHLC is used for patterns/pivots; Adj Close is used for returns/RS. Review all bars around each labelled event before treating the event as regression ground truth.",
     }
     errors = 0
     for symbol in args.symbols:
@@ -67,7 +66,7 @@ def main() -> int:
     metadata_path = args.output_dir / "capture_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Metadata: {metadata_path}")
-    print("Reminder: data capture is not a labelled regression test; fill manifest dates and expected outcomes after chart review.")
+    print("Reminder: capture is not a labelled regression test; fill manifest dates and expected outcomes after chart review.")
     return 1 if errors else 0
 
 

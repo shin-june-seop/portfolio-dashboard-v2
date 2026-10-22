@@ -27,7 +27,7 @@ st.set_page_config(page_title="Portfolio Dashboard V2", page_icon="📊", layout
 @st.cache_data(ttl=900, show_spinner=False)
 def _load_yfinance_bars(symbol: str) -> pd.DataFrame:
     from dashboard_v2.services.yfinance_provider import YFinanceDailyProvider
-    return YFinanceDailyProvider(history_days=5 * 365, auto_adjust=True).daily_bars(symbol)
+    return YFinanceDailyProvider(history_days=5 * 365).daily_bars(symbol)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -49,7 +49,7 @@ def _analyze_cached(symbol: str, bars: pd.DataFrame, seed_snapshot: dict | None,
 
 
 def _load_bars(symbol: str, source: str) -> pd.DataFrame:
-    if source == "Yahoo Finance (provisional)":
+    if source == "Yahoo Finance (EOD)":
         return _load_yfinance_bars(symbol)
     if source == "Bundled regression data (historical)":
         return _load_regression_bars(symbol)
@@ -68,7 +68,7 @@ def _run_scan(symbols: list[str], source: str) -> tuple[pd.DataFrame, dict[str, 
             errors.append((symbol, f"{type(exc).__name__}: {exc}"))
 
     benchmark = None
-    if source == "Yahoo Finance (provisional)":
+    if source == "Yahoo Finance (EOD)":
         try:
             benchmark = _load_yfinance_bars("SPY")
         except Exception as exc:
@@ -160,6 +160,8 @@ def _render_symbol_detail(frame: pd.DataFrame, raw: dict[str, pd.DataFrame]):
             "detected_pattern_diagnostic": row["detected_pattern_diagnostic"],
             "replay_provenance": row["replay_provenance"],
             "validation_status": row["validation_status"],
+            "technical_price_basis": row["technical_price_basis"],
+            "return_price_basis": row["return_price_basis"],
         })
 
 
@@ -174,14 +176,14 @@ st.sidebar.divider()
 st.sidebar.markdown("**시장 데이터**")
 source = st.sidebar.selectbox(
     "데이터 공급원",
-    ["연결 안 함 (기본)", "Yahoo Finance (provisional)", "Bundled regression data (historical)"],
+    ["연결 안 함 (기본)", "Yahoo Finance (EOD)", "Bundled regression data (historical)"],
     index=0,
-    help="Yahoo Finance는 현재 후보 공급원이며 가격 조정/완료봉 정책의 최종 승인은 아직 대기 중입니다. 선택 시 실제 네트워크 호출을 수행합니다.",
+    help="미국 거래소의 가장 최근 완료 일봉만 사용합니다. 패턴/피봇은 auto_adjust=False OHLC, 다기간 수익률과 RS는 split·배당 조정 Adj Close 기준입니다. 완료 일봉이 없거나 데이터가 불완전하면 해당 종목을 표시하지 않습니다.",
 )
 symbol_text = st.sidebar.text_area("관심종목", value=DEFAULT_SYMBOLS, height=110, help="쉼표 또는 줄바꿈으로 구분")
 symbols = list(dict.fromkeys(x.strip().upper() for x in symbol_text.replace("\n", ",").split(",") if x.strip()))
-if source == "Yahoo Finance (provisional)":
-    st.sidebar.warning("Yahoo Finance 임시 정책: auto_adjust=True, 미국 정규장 완료 일봉 기준")
+if source == "Yahoo Finance (EOD)":
+    st.sidebar.info("EOD 정책 확정: auto_adjust=False OHLC로 패턴/피봇, Adj Close로 다기간 수익률·RS, RVOL은 당일 완료 거래량 ÷ 직전 20개 완료 일봉 평균. 미국 동부시간 16:15 전에는 당일 봉을 제외합니다.")
 elif source == "Bundled regression data (historical)":
     st.sidebar.info("고정된 과거 검증 데이터입니다. 현재 시세가 아닙니다.")
 
@@ -194,7 +196,7 @@ if page in {"Momentum Monitor", "Pattern Scanner"}:
         st.info("왼쪽에서 데이터 공급원을 선택하면 공통 재베이스·패턴·피봇 엔진이 종목을 분석합니다. 기본 상태에서는 임의의 시세나 신호를 표시하지 않습니다.")
         st.markdown("**이 화면에서 사용하는 공통 엔진**")
         st.write("완료 일봉 → 날짜순 재베이스 상태 → 단일 주 패턴/후보 피봇 → 역사적 Breakout Pivot → EOD Stage → 거리/RVOL/모멘텀")
-        st.caption("Yahoo Finance를 선택하면 실제 네트워크 데이터를 사용합니다. 공급원/가격 조정 정책이 최종 승인되기 전까지는 임시 분석으로 취급하세요.")
+        st.caption("Yahoo Finance EOD 정책: 완료된 미국 일봉만 사용합니다. 당일 가격 변동이 필요한 기능은 추후 별도 Live Monitor로 분리합니다.")
     elif not symbols:
         st.warning("관심종목을 하나 이상 입력하세요.")
     else:
@@ -209,10 +211,10 @@ if page in {"Momentum Monitor", "Pattern Scanner"}:
             k2.metric("최신 기준일", latest_date)
             k3.metric("재베이스 진행", int(result["rebase_active"].sum()))
             k4.metric("계산 시간", f"{elapsed:.1f}s")
-            if source == "Yahoo Finance (provisional)":
-                st.warning("데이터 출처는 임시 Yahoo Finance 어댑터입니다. 조정 가격 기준과 공급자 정책의 승인 전에는 신호를 실거래 주문으로 자동 연결하지 않습니다.")
+            if source == "Yahoo Finance (EOD)":
+                st.warning("Yahoo Finance는 외부 공급원이며 과거 데이터가 정정될 수 있습니다. 이 화면은 읽기 전용 분석이며 자동 주문을 제출하지 않습니다.")
             if result["replay_provenance"].eq("ROLLING_260_BAR_REPLAY").any():
-                st.warning("일부 종목은 호환 가능한 과거 스냅샷이 없어 최근 260봉만 재생했습니다. 이 종목의 더 오래된 Breakout Pivot 이력은 완전 재구성된 상태가 아닐 수 있습니다.")
+                st.warning("Yahoo EOD는 새 auto_adjust=False OHLC 기준을 사용하므로, 과거 auto_adjust=True 스냅샷과 혼합하지 않고 최근 260봉을 재생합니다. 이 구간보다 오래된 Breakout Pivot 이력은 재구성되지 않을 수 있습니다.")
             if result["validation_status"].eq("OBSERVED_NOT_VALIDATED").any():
                 st.caption("엔진 출력은 관측 결과이며, 별도 라벨링된 정답 차트와 대조되지 않은 항목은 검증 완료로 간주하지 않습니다.")
 
@@ -238,7 +240,7 @@ if page in {"Momentum Monitor", "Pattern Scanner"}:
             _render_symbol_detail(result, raw)
 
         if errors:
-            with st.expander(f"데이터/분석 오류 ({len(errors)})", expanded=not bool(len(result) if not result.empty else 0)):
+            with st.expander(f"데이터/분석 오류 ({len(errors)})", expanded=bool(errors)):
                 st.dataframe(pd.DataFrame(errors, columns=["종목", "오류"]), use_container_width=True, hide_index=True)
 
 elif page == "App Monitor":
@@ -248,7 +250,7 @@ elif page == "App Monitor":
         ("날짜순 재베이스/패턴/피봇 재생", "구현·테스트"),
         ("Momentum Monitor 공통 엔진 연결", "구현"),
         ("Pattern Scanner 공통 엔진 연결", "구현"),
-        ("Yahoo Finance 공급원", "선택형·임시 정책"),
+        ("Yahoo Finance 공급원", "EOD 데이터 정책 적용 · 외부 데이터 정정 가능"),
         ("7개 회귀 종목 과거 스냅샷", "포함·정답 라벨은 미검증"),
         ("Supabase 실스키마/RLS 연결", "미연결·기존 DB 보호"),
         ("나머지 화면 전체 기능 이관", "후속 구현"),
@@ -267,4 +269,4 @@ else:
     st.info("이 화면은 메뉴를 유지하고 있습니다. 기능 명세서에 따라 후속 단계에서 실제 데이터/기능을 연결합니다. 현재 화면은 아직 기능 이관이 완료되지 않았습니다.")
 
 st.divider()
-st.caption("운영 안전장치: DB 쓰기 없음 · 주문 제출 없음 · 기존 대시보드 변경 없음 · 공급원 미승인 정책 명시")
+st.caption("운영 안전장치: 완료 일봉 전용 · DB 쓰기 없음 · 주문 제출 없음 · 기존 대시보드 변경 없음 · Yahoo 원천 데이터 정정 가능")

@@ -1,36 +1,38 @@
-# Data Source and Completed-Bar Policy — Phase 3 Candidate
+# V2 EOD Market-Data Policy
 
-## Status
+**Status: approved for V2 end-of-day analysis on 2026-10-22.** This is not approval for automatic trading; the app is read-only and Yahoo Finance remains an external source whose history can be revised or be temporarily unavailable.
 
-**Not approved for production; adapter remains opt-in and is not connected to the Streamlit app.** The purpose of this phase is to enable chart-parity testing without creating a hidden assumption that the final provider or price basis has been selected.
+## 1. Scope: completed daily bars only
 
-## Legacy-source observations
+- Momentum Monitor and Pattern Scanner consume completed daily OHLCV bars only.
+- Live/current-session bars are never used by the EOD pattern, pivot, stage, or RVOL engines. Intraday changes belong in a future, separate Live Monitor.
+- Yahoo Finance daily data for US-listed stocks/ETFs is considered eligible only after **16:15 America/New_York**, giving a 15-minute finalization buffer after the regular 16:00 close. Before then, today's bar is excluded.
+- `exchange-calendars` (`XNYS`) determines the latest expected completed trading session, including weekends and exchange holidays. If Yahoo does not return the expected completed session, the provider raises a data error and that symbol is not analyzed; it does not silently use stale data.
+- An explicitly supplied `as_of_date` is a replay cutoff. The latest expected XNYS session on/before that date must be present. If the cutoff is today and it is earlier than 16:15 ET, today remains excluded.
 
-A static review of the current legacy `app.py` found multiple `yfinance` paths. The main EOD helper `v171_fetch_ohlcv` uses `Ticker.history(..., auto_adjust=True, actions=False)` and excludes the current New York exchange-local date before 16:00 ET. Other fetch paths also use `yfinance`, but request windows and some options differ, so this is not a claim that every legacy page uses one uniform policy.
+## 2. Separate price series
 
-Current upstream yfinance documentation says `auto_adjust` adjusts OHLC automatically and documents `history(end=...)` as exclusive. V2 passes these parameters explicitly to avoid relying on defaults. References:
+- Provider: Yahoo Finance via `yfinance`, daily interval, `prepost=False`, `auto_adjust=False`, `actions=False`.
+- Pattern, base, pivot, stage and price-distance calculations use the provider's OHLC `Open/High/Low/Close` series requested with `auto_adjust=False`. The client does not apply the `Adj Close / Close` dividend-adjustment factor to technical OHLC; Yahoo's own corporate-action/split handling remains part of its upstream data convention.
+- Holding-period returns (1M/3M/6M/12M) and relative strength versus SPY use the separately supplied `Adj Close`, adjusted by Yahoo for stock splits and cash distributions.
+- The table's `일간 %` is a traded-price Close-to-Close change in the technical OHLC basis; multi-period returns and RS use `Adj Close` total-return values.
+- RVOL uses today's completed Volume divided by the arithmetic mean of the **prior 20 completed bars' Volume**, excluding today's volume. The breakout confirmation threshold remains EOD RVOL >= 1.30x.
+- `Adj Close` must be present, positive, finite, and aligned by session date. Missing OHLCV, non-finite OHLCV, zero volume on the latest bar, missing adjusted-close values, or a stale/missing expected session causes the provider to fail closed. The app displays a data/analysis error for that symbol rather than generating a signal.
 
-- https://ranaroussi.github.io/yfinance/reference/yfinance.price_history.html
-- https://github.com/ranaroussi/yfinance/blob/main/yfinance/scrapers/history.py
+## 3. Seed and historical fixture compatibility
 
-## Implemented candidate adapter
+- The bundled OHLCV CSVs and chronological replay snapshot were captured with the earlier `auto_adjust=True` total-return-adjusted OHLC basis. They remain available for the explicit “Bundled regression data (historical)” mode; there `Close` is already adjusted and is used as the return series when no separate `Adj Close` column exists.
+- Yahoo's new split-normalized OHLC plus separate `Adj Close` basis is not mixed with the old seed state. When separate `Adj Close` is present, analysis intentionally avoids resuming the legacy basis snapshot and uses a transparent rolling 260-bar replay. The UI warns that events older than this window may not be reconstructed. This avoids silently comparing pivots from different price bases.
+- The current close can still match a legacy seed within tolerance while historical pivots differ due to dividend adjustment; close-only compatibility is therefore insufficient to establish basis compatibility.
 
-`dashboard_v2/services/yfinance_provider.py`:
+## 4. Failure behavior and operational boundary
 
-- Optional dependency: `yfinance` (install with `pip install -e ".[market-data]"`).
-- Daily bars only; `prepost=False`; `actions=False`.
-- Candidate price basis: `auto_adjust=True`, matching the main legacy EOD helper.
-- Normalizes to `Date, Open, High, Low, Close, Volume` and rejects ambiguous MultiIndex or missing required fields.
-- For live requests, excludes the current New York exchange date before 16:00 ET; after 16:00 ET it can include that day's bar, matching the current legacy helper's broad rule.
-- Explicit historical `as_of_date` requests include that historical date (if returned) and exclude later rows.
-- No network request is made during app startup; the service is not injected into the app by default.
+- No synthetic/fallback prices or signals are created if required live data is absent or stale.
+- A failed Yahoo request or validation check omits the affected symbol from the analysis results and exposes a data/analysis error in the UI.
+- Yahoo is a third-party source without an application-specific freshness guarantee. Past bars can be corrected. The app is read-only: no Supabase writes, orders, or automatic trading.
+- This is an explicit V2 EOD policy. A future Live Monitor must use a separate intraday data path and must not alter EOD historical state.
 
-## Decisions still required before real signal usage
+## References
 
-1. Approve/replace provider: Yahoo/yfinance is the current candidate, not a guaranteed service-level data contract.
-2. Approve price basis: split-adjusted only vs split-and-dividend-adjusted OHLC. This materially changes long-history price levels and can alter pivot comparisons when mixed with unadjusted data.
-3. Approve daily-bar completion rule: 16:00 ET boundary vs a post-close finalization buffer / exchange-calendar-aware readiness check.
-4. Confirm treatment of corrections, missing rows, vendor outage, stock splits, symbol changes, ETFs, and different exchanges.
-5. Compare fetched values and selected pivots to the source/legacy dashboard around labelled regression dates.
-
-Until those items are approved, the adapter is only a controlled data-capture and parity-testing aid. Live data and official signal state remain disconnected.
+- yfinance `PriceHistory.history` documents `auto_adjust` and the exclusive `end` boundary: https://ranaroussi.github.io/yfinance/reference/yfinance.price_history.html
+- Yahoo Finance explains that adjusted close reflects stock splits and dividend distributions: https://in.help.yahoo.com/kb/adjusted-close-sln28256.html

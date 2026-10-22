@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Iterable
 import pandas as pd
+import numpy as np
 
 REQUIRED_OHLCV = ("Open", "High", "Low", "Close", "Volume")
 
@@ -64,8 +65,9 @@ def normalize_ohlcv(frame: pd.DataFrame, *, as_of_date: date | str | None = None
     df["Date"] = normalized_dates
     for col in REQUIRED_OHLCV:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    if df[list(REQUIRED_OHLCV)].isna().any().any():
-        raise MarketDataError("OHLCV contains missing/non-numeric values")
+    numeric = df[list(REQUIRED_OHLCV)].to_numpy(dtype="float64", copy=False)
+    if not np.isfinite(numeric).all():
+        raise MarketDataError("OHLCV contains missing/non-numeric/non-finite values")
     if (df["Volume"] < 0).any():
         raise MarketDataError("Volume must not be negative")
     if (df["High"] < df[["Open", "Close", "Low"]].max(axis=1)).any():

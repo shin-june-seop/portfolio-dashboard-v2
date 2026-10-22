@@ -1,13 +1,17 @@
-"""Opt-in Yahoo/yfinance daily-bar adapter.
+"""Yahoo Finance daily OHLCV adapter under the approved EOD data policy.
 
-This adapter mirrors the legacy app's current price-source convention as a
-candidate for parity testing. It is deliberately not wired into Streamlit by
-default because provider, adjustment, and completed-bar policy still require
-explicit product approval.
+Technical patterns/pivots use Yahoo OHLC with auto_adjust=False (Yahoo's
+split-normalized traded-price series). Multi-period returns use Adj Close,
+which Yahoo adjusts for splits and cash distributions. Only the latest
+completed XNYS session is accepted; the current session is withheld until a
+15-minute post-close finalization buffer has elapsed. This provider is for
+read-only analysis and can fail closed when data is stale or incomplete.
 """
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
+import math
 from zoneinfo import ZoneInfo
 from typing import Callable, Any
 
@@ -18,10 +22,12 @@ from .market_data_service import MarketDataProviderNotConfigured
 
 NY = ZoneInfo("America/New_York")
 REQUIRED_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
+ADJUSTED_CLOSE = "Adj Close"
+DEFAULT_FINALIZATION_CUTOFF = time(16, 15)
 
 
 class MarketDataFetchError(RuntimeError):
-    """Raised when the optional external provider cannot return daily bars."""
+    """Raised when the provider cannot return a trustworthy completed daily bar."""
 
 
 def _as_exchange_date(value: Any) -> date:
@@ -32,33 +38,50 @@ def _as_exchange_date(value: Any) -> date:
     return stamp.date()
 
 
+@lru_cache(maxsize=1)
+def _xnys_calendar():
+    try:
+        import exchange_calendars as xcals
+    except ImportError as exc:  # pragma: no cover - dependency is installed in app
+        raise MarketDataProviderNotConfigured(
+            "exchange-calendars is required for the completed-session check"
+        ) from exc
+    return xcals.get_calendar("XNYS")
+
+
+def _latest_xnys_session_on_or_before(day: date) -> date:
+    """Return the latest NYSE session on/before a date, including holidays/weekends."""
+    try:
+        session = _xnys_calendar().date_to_session(pd.Timestamp(day), direction="previous")
+    except Exception as exc:
+        raise MarketDataFetchError(
+            f"Could not determine the expected XNYS session for {day}: {type(exc).__name__}"
+        ) from exc
+    return pd.Timestamp(session).date()
+
+
 class YFinanceDailyProvider:
-    """Fetch adjusted daily OHLCV with a testable U.S. regular-session cutoff.
+    """Fetch split-normalized OHLCV plus a separate dividend-adjusted close.
 
-    Defaults intentionally mirror the legacy dashboard: `auto_adjust=True`,
-    regular session only, and a same-day daily bar is eligible only at/after
-    16:00 America/New_York. This is a *candidate parity policy*, not a final
-    V2 policy approval. No writes, broker actions, or persistent side effects.
-
-    `as_of_date` means a historical replay cutoff; the bar on that date is
-    retained if returned because historical sessions are presumed completed.
-    When omitted, the current exchange date is excluded until regular close.
+    `auto_adjust=False` is fixed by policy: patterns/pivots must not inherit the
+    dividend-adjustment factor applied to Adj Close. `as_of_date` is for an
+    explicit historical replay cutoff; its latest expected XNYS session must be
+    present. Live requests withhold the current date until 16:15 New York time,
+    and then require that session's bar to be present or fail closed.
     """
 
     def __init__(
         self,
         *,
         history_days: int = 5 * 365,
-        auto_adjust: bool = True,
-        session_close: time = time(16, 0),
+        finalization_cutoff: time = DEFAULT_FINALIZATION_CUTOFF,
         now_fn: Callable[[], datetime] | None = None,
         ticker_factory: Callable[[str], Any] | None = None,
     ) -> None:
         if history_days < 60:
             raise ValueError("history_days must be at least 60 calendar days")
         self.history_days = int(history_days)
-        self.auto_adjust = bool(auto_adjust)
-        self.session_close = session_close
+        self.finalization_cutoff = finalization_cutoff
         self._now_fn = now_fn or (lambda: datetime.now(tz=NY))
         self._ticker_factory = ticker_factory
 
@@ -69,7 +92,7 @@ class YFinanceDailyProvider:
             import yfinance as yf
         except ImportError as exc:
             raise MarketDataProviderNotConfigured(
-                "yfinance is optional. Install with: pip install -e '.[market-data]'"
+                "yfinance is required for Yahoo Finance EOD data."
             ) from exc
         return yf.Ticker(symbol)
 
@@ -79,26 +102,41 @@ class YFinanceDailyProvider:
             raise ValueError("symbol must not be empty")
 
         explicit_as_of = as_of_date is not None
-        live_now_ny: datetime | None = None
+        now = self._now_fn()
+        if now.tzinfo is None:
+            raise ValueError("now_fn must return a timezone-aware datetime")
+        live_now_ny = now.astimezone(NY)
         if explicit_as_of:
             cutoff = pd.Timestamp(as_of_date).date()
-            end_exclusive = cutoff + timedelta(days=1)
+            if cutoff > live_now_ny.date():
+                raise MarketDataFetchError(
+                    f"as_of_date {cutoff} is in the future relative to New York date {live_now_ny.date()}"
+                )
         else:
-            now = self._now_fn()
-            if now.tzinfo is None:
-                raise ValueError("now_fn must return a timezone-aware datetime")
-            live_now_ny = now.astimezone(NY)
             cutoff = live_now_ny.date()
-            end_exclusive = cutoff + timedelta(days=1)
+        end_exclusive = cutoff + timedelta(days=1)
 
+        # Explicit historical cutoffs can include their bar only if that
+        # session is already complete in real time. If the requested cutoff is
+        # today before the buffer, behave like an EOD scan and withhold today.
+        current_session_not_final = (
+            cutoff == live_now_ny.date()
+            and live_now_ny.time().replace(tzinfo=None) < self.finalization_cutoff
+        )
+        if current_session_not_final:
+            expected_reference_date = cutoff - timedelta(days=1)
+        else:
+            expected_reference_date = cutoff
+
+        expected_session = _latest_xnys_session_on_or_before(expected_reference_date)
         start = cutoff - timedelta(days=self.history_days)
         ticker = self._get_ticker(ticker_symbol)
         try:
             raw = ticker.history(
                 start=start.isoformat(),
-                end=end_exclusive.isoformat(),  # yfinance's `end` is exclusive
+                end=end_exclusive.isoformat(),  # yfinance's end date is exclusive
                 interval="1d",
-                auto_adjust=self.auto_adjust,
+                auto_adjust=False,
                 actions=False,
                 prepost=False,
                 timeout=15,
@@ -109,10 +147,8 @@ class YFinanceDailyProvider:
             ) from exc
 
         if raw is None or raw.empty:
-            return pd.DataFrame(columns=["Date", *REQUIRED_COLUMNS])
+            raise MarketDataFetchError(f"No daily bars returned for {ticker_symbol}")
 
-        # Ticker.history normally returns simple columns, but reject ambiguous
-        # multi-index columns rather than guessing the selected field/symbol.
         if isinstance(raw.columns, pd.MultiIndex):
             raise MarketDataFetchError(
                 f"Unexpected MultiIndex columns for single-symbol request: {ticker_symbol}"
@@ -122,22 +158,60 @@ class YFinanceDailyProvider:
             raise MarketDataFetchError(
                 f"Provider omitted required fields for {ticker_symbol}: {', '.join(missing)}"
             )
+        if ADJUSTED_CLOSE not in raw.columns:
+            raise MarketDataFetchError(
+                f"Provider omitted {ADJUSTED_CLOSE} required for total-return calculations: {ticker_symbol}"
+            )
 
+        dates = [_as_exchange_date(value) for value in raw.index]
         out = raw.loc[:, list(REQUIRED_COLUMNS)].copy()
-        out.insert(0, "Date", [_as_exchange_date(value) for value in raw.index])
-        out["Date"] = pd.to_datetime(out["Date"])
+        out.insert(0, "Date", pd.to_datetime(dates))
+        out[ADJUSTED_CLOSE] = pd.to_numeric(raw[ADJUSTED_CLOSE], errors="coerce").to_numpy()
         out = out.loc[out["Date"].dt.date <= cutoff].copy()
 
-        # On a live request, exclude today's row until the exchange's scheduled
-        # regular-session close. This follows the legacy boundary; the final
-        # policy may use a post-close publication buffer after parity testing.
-        if not explicit_as_of and live_now_ny is not None:
-            if live_now_ny.time().replace(tzinfo=None) < self.session_close:
-                out = out.loc[out["Date"].dt.date < live_now_ny.date()].copy()
+        # Never expose a still-forming current-session bar to EOD analysis.
+        if current_session_not_final:
+            out = out.loc[out["Date"].dt.date < cutoff].copy()
 
+        # OHLCV and Adj Close are both required. Fail closed rather than emit
+        # partial or mixed-basis data that can create misleading pivots/signals.
         try:
-            return normalize_ohlcv(out)
+            normalized = normalize_ohlcv(out[["Date", *REQUIRED_COLUMNS]])
         except Exception as exc:
             raise MarketDataFetchError(
                 f"Invalid OHLCV returned for {ticker_symbol}: {type(exc).__name__}: {exc}"
             ) from exc
+
+        adjusted = out[["Date", ADJUSTED_CLOSE]].copy().reset_index(drop=True)
+        adjusted_values = adjusted[ADJUSTED_CLOSE].astype(float).tolist()
+        if any(not math.isfinite(value) for value in adjusted_values):
+            raise MarketDataFetchError(f"Missing/non-finite Adj Close for {ticker_symbol}")
+        if any(value <= 0 for value in adjusted_values):
+            raise MarketDataFetchError(f"Non-positive Adj Close for {ticker_symbol}")
+        if not normalized.empty:
+            # Enforce non-zero reported volume on the latest signal bar. A zero
+            # value can otherwise silently make RVOL unavailable or misleading.
+            if float(normalized.iloc[-1]["Volume"]) <= 0:
+                raise MarketDataFetchError(
+                    f"Latest completed bar has missing/zero volume for {ticker_symbol}"
+                )
+            actual_latest = normalized.iloc[-1]["Date"].date()
+            if actual_latest != expected_session:
+                raise MarketDataFetchError(
+                    f"Latest completed XNYS session missing/incomplete for {ticker_symbol}: "
+                    f"expected {expected_session}, received {actual_latest}"
+                )
+        else:
+            raise MarketDataFetchError(f"No completed XNYS-session bars available for {ticker_symbol}")
+
+        # Normalize the adjusted-close dates separately, then merge so the
+        # OHLCV columns and total-return series stay aligned but not conflated.
+        try:
+            result = normalized.merge(adjusted, on="Date", how="left", validate="one_to_one")
+        except Exception as exc:
+            raise MarketDataFetchError(
+                f"Could not align Adj Close for {ticker_symbol}: {type(exc).__name__}"
+            ) from exc
+        if result[ADJUSTED_CLOSE].isna().any():
+            raise MarketDataFetchError(f"Adj Close dates do not align to OHLCV for {ticker_symbol}")
+        return result[["Date", *REQUIRED_COLUMNS, ADJUSTED_CLOSE]].reset_index(drop=True)

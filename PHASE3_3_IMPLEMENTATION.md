@@ -45,5 +45,5 @@ Added tests verify that the large-move report identifies an event and context ba
 ## Safety and validation boundary
 
 - Data is read locally; no internet calls or database writes are made by these review tools.
-- Captured Yahoo OHLCV remains a candidate source and may use adjusted values. Numeric pivots must not be compared with legacy snapshots until the price basis is reconciled.
+- Captured Yahoo OHLCV follows the approved V2 policy. Numeric pivots must not be compared with the legacy `auto_adjust=True` snapshot without reconciling price basis; the historical tool outputs remain manual-review evidence, not ground truth.
 - No row is labeled PASS from V2-generated output alone. Manual labels require independent historical evidence, such as saved dashboard screenshots, journal records, or an explicitly reviewed chart/date.

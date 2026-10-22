@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import math
 
 import pandas as pd
 
@@ -56,6 +57,54 @@ def _date_string(value: Any) -> str | None:
         return pd.Timestamp(value).date().isoformat()
     except (TypeError, ValueError):
         return str(value)
+
+
+def _adjusted_close_column(frame: pd.DataFrame) -> Any | None:
+    """Find a Yahoo-style dividend/split-adjusted close column, if supplied."""
+    for column in frame.columns:
+        normalized = "".join(str(column).strip().lower().replace("_", " ").split())
+        if normalized in {"adjclose", "adjustedclose"}:
+            return column
+    return None
+
+
+def _aligned_return_close(raw_bars: pd.DataFrame, bars: pd.DataFrame) -> tuple[pd.Series, str]:
+    """Return an adjusted-close series aligned to normalized technical OHLCV dates.
+
+    Yahoo production bars must include Adj Close; bundled legacy fixtures were
+    captured with auto_adjust=True, so their OHLC Close is already total-return
+    adjusted and is an intentional fallback. Simple unit-test fixtures likewise
+    use Close when no separate adjusted series exists.
+    """
+    adjusted_col = _adjusted_close_column(raw_bars)
+    if adjusted_col is None:
+        return bars["Close"].astype(float).reset_index(drop=True), "CLOSE_FALLBACK_NO_ADJ_CLOSE"
+
+    source = raw_bars.copy()
+    date_column = next(
+        (col for col in source.columns if str(col).strip().lower() in {"date", "datetime", "timestamp"}),
+        None,
+    )
+    date_values = source[date_column] if date_column is not None else source.index
+    try:
+        dates = [pd.Timestamp(value).date() for value in date_values]
+        values = pd.to_numeric(source[adjusted_col], errors="coerce").astype(float).tolist()
+    except Exception as exc:
+        raise ValueError("Adjusted Close cannot be parsed; refusing to calculate return signals") from exc
+    if len(set(dates)) != len(dates):
+        raise ValueError("Adjusted Close contains duplicate dates; refusing to calculate returns")
+    adjustment_by_date = dict(zip(dates, values))
+    aligned_values = []
+    for value in bars["Date"]:
+        day = pd.Timestamp(value).date()
+        adjusted_value = adjustment_by_date.get(day)
+        if adjusted_value is None or not pd.notna(adjusted_value):
+            raise ValueError(f"Adjusted Close missing for {day}; refusing to calculate return signals")
+        numeric_value = float(adjusted_value)
+        if not math.isfinite(numeric_value) or numeric_value <= 0:
+            raise ValueError(f"Adjusted Close invalid for {day}; refusing to calculate return signals")
+        aligned_values.append(numeric_value)
+    return pd.Series(aligned_values, dtype="float64"), "YAHOO_ADJ_CLOSE_SPLIT_AND_DISTRIBUTION_ADJUSTED"
 
 
 def _compatible_seed(bars: pd.DataFrame, seed: dict[str, Any] | None) -> bool:
@@ -109,12 +158,23 @@ def analyze_symbol(
     bars = normalize_ohlcv(raw_bars)
     if bars.empty:
         raise ValueError(f"No daily bars available for {ticker}")
-    state, provenance = _history_snapshot(ticker, bars, seed_snapshot)
+    # The current Yahoo policy supplies split-normalized OHLC plus a separate
+    # adjusted close. Do not resume a state snapshot built on dividend-adjusted
+    # OHLC; use the transparent 260-bar replay instead to avoid mixed price bases.
+    has_separate_adjusted_close = _adjusted_close_column(raw_bars) is not None
+    return_close, return_price_basis = _aligned_return_close(raw_bars, bars)
+    state, provenance = _history_snapshot(
+        ticker, bars, None if has_separate_adjusted_close else seed_snapshot
+    )
     last = bars.iloc[-1]
     previous = bars.iloc[-2] if len(bars) > 1 else None
     close = float(last["Close"])
     prior_close = float(previous["Close"]) if previous is not None else None
+    # Daily % describes the price move in the technical OHLC basis; holding
+    # period returns and relative strength below use total-return adjusted close.
     close_change = (close / prior_close - 1.0) * 100 if prior_close else None
+    if float(last["Volume"]) <= 0:
+        raise ValueError(f"Latest completed bar has zero volume for {ticker}; no signal emitted")
 
     sma = {period: _num(bars["Close"].tail(period).mean()) if len(bars) >= period else None for period in (10, 20, 50, 200)}
     twenty_ref = twenty_day_reference(bars)
@@ -128,18 +188,21 @@ def analyze_symbol(
 
     return_pct: dict[int, float | None] = {}
     for lookback in (21, 63, 126, 252):
-        if len(bars) > lookback and float(bars["Close"].iloc[-lookback - 1]) > 0:
-            return_pct[lookback] = (close / float(bars["Close"].iloc[-lookback - 1]) - 1) * 100
+        if len(bars) > lookback and float(return_close.iloc[-lookback - 1]) > 0:
+            return_pct[lookback] = (float(return_close.iloc[-1]) / float(return_close.iloc[-lookback - 1]) - 1) * 100
         else:
             return_pct[lookback] = None
 
     rs_63 = None
     if benchmark_bars is not None and not benchmark_bars.empty:
         benchmark = normalize_ohlcv(benchmark_bars)
-        merged = bars[["Date", "Close"]].merge(benchmark[["Date", "Close"]], on="Date", suffixes=("_symbol", "_benchmark"))
+        benchmark_return_close, _ = _aligned_return_close(benchmark_bars, benchmark)
+        symbol_perf = pd.DataFrame({"Date": bars["Date"], "AdjustedCloseSymbol": return_close})
+        benchmark_perf = pd.DataFrame({"Date": benchmark["Date"], "AdjustedCloseBenchmark": benchmark_return_close})
+        merged = symbol_perf.merge(benchmark_perf, on="Date", how="inner", validate="one_to_one")
         if len(merged) > 63:
-            sym_return = merged["Close_symbol"].iloc[-1] / merged["Close_symbol"].iloc[-64] - 1
-            bench_return = merged["Close_benchmark"].iloc[-1] / merged["Close_benchmark"].iloc[-64] - 1
+            sym_return = merged["AdjustedCloseSymbol"].iloc[-1] / merged["AdjustedCloseSymbol"].iloc[-64] - 1
+            bench_return = merged["AdjustedCloseBenchmark"].iloc[-1] / merged["AdjustedCloseBenchmark"].iloc[-64] - 1
             rs_63 = (sym_return - bench_return) * 100
 
     # The primary pattern/pivot is always the one chosen by the chronological
@@ -186,6 +249,8 @@ def analyze_symbol(
     return {
         "ticker": ticker,
         "as_of_date": pd.Timestamp(last["Date"]).date().isoformat(),
+        "technical_price_basis": "YAHOO_OHLC_AUTO_ADJUST_FALSE" if has_separate_adjusted_close else "LEGACY_TOTAL_RETURN_ADJUSTED_OHLC",
+        "return_price_basis": return_price_basis,
         "close": close,
         "day_change_pct": _pct(close_change),
         "pattern": current_pattern,

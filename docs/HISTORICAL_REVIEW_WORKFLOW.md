@@ -4,11 +4,11 @@
 
 - The user's latest capture metadata reports all seven tickers as `OK`, each with 1,254 rows from 2021-10-20 through 2026-10-19.
 - The `NEEDS_LABEL` status in the regression runner is expected because the manifest has no manually-reviewed dates/expected outputs yet.
-- A successful download does not validate exact price adjustment basis or pattern accuracy.
+- A successful download does not validate pattern accuracy; capture metadata records the approved technical OHLC and adjusted-close return bases.
 
 ## Next actions
 
-1. Run OHLCV audit and inspect `ohlcv_audit.csv`. Investigate `FAIL`; review warnings and adjustment basis before numerical pivot comparisons.
+1. Run OHLCV audit and inspect `ohlcv_audit.csv`. Investigate `FAIL`; review any basis warnings before numerical pivot comparisons. Never compare a pivot derived from legacy `auto_adjust=True` OHLC directly with the new `auto_adjust=False` technical OHLC basis without reconciliation.
 2. Run the rebase review worksheet. It lists dates where the close first falls at least 10% below the rolling 20-bar high and compares unconstrained vs rebase-gated pattern observations.
 3. Compare rows around known incidents against the old dashboard screenshots, trade journal, and chart. Record exact as-of date and prior pivot values from historical evidence, not by copying V2's observed output into expected values.
 4. Only then fill manifest labels.
