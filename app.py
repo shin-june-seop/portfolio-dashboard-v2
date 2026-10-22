@@ -155,6 +155,16 @@ def _render_symbol_detail(frame: pd.DataFrame, raw: dict[str, pd.DataFrame]):
             "breakout_cycle_active": bool(row["breakout_cycle_active"]),
             "breakout_event_today": bool(row["breakout_event"]),
             "breakout_failure_today": bool(row["breakout_failure"]),
+            "historical_breakout_recovered": bool(row.get("historical_breakout_recovered", False)),
+            "historical_breakout_recovery_pattern": row.get("historical_breakout_recovery_pattern"),
+            "historical_breakout_recovery_event_date": row.get("historical_breakout_recovery_event_date"),
+            "historical_breakout_recovery_reason": row.get("historical_breakout_recovery_reason"),
+            "historical_breakout_recovery_seed_pattern": row.get("historical_breakout_recovery_seed_pattern"),
+            "historical_breakout_recovery_seed_pattern_matches_current": row.get("historical_breakout_recovery_seed_pattern_matches_current"),
+            "historical_breakout_recovery_candidate_pivot": _num_or_none(row.get("historical_breakout_recovery_candidate_pivot")),
+            "historical_breakout_recovery_previous_close": _num_or_none(row.get("historical_breakout_recovery_previous_close")),
+            "historical_breakout_recovery_event_close": _num_or_none(row.get("historical_breakout_recovery_event_close")),
+            "historical_breakout_recovery_attempted_event_date": row.get("historical_breakout_recovery_attempted_event_date"),
             "pocket_pivot_today": bool(row["pocket_pivot_today"]),
             "pocket_pivot_reason": row["pocket_pivot_reason"],
             "detected_pattern_diagnostic": row["detected_pattern_diagnostic"],
@@ -214,7 +224,7 @@ if page in {"Momentum Monitor", "Pattern Scanner"}:
             if source == "Yahoo Finance (EOD)":
                 st.warning("Yahoo Finance는 외부 공급원이며 과거 데이터가 정정될 수 있습니다. 이 화면은 읽기 전용 분석이며 자동 주문을 제출하지 않습니다.")
             if result["replay_provenance"].eq("ROLLING_300_BAR_REPLAY").any():
-                st.warning("Yahoo EOD는 새 auto_adjust=False OHLC 기준을 사용하므로, 과거 auto_adjust=True 스냅샷과 혼합하지 않고 최근 260봉을 재생합니다. 이 구간보다 오래된 Breakout Pivot 이력은 재구성되지 않을 수 있습니다.")
+                st.warning("Yahoo EOD는 새 auto_adjust=False OHLC 기준을 사용하므로, 과거 auto_adjust=True 스냅샷과 혼합하지 않습니다. 과거 Breakout Pivot은 현재 OHLC에서 패턴과 실제 종가 돌파를 재검증한 경우에만 복원됩니다.")
             if result["validation_status"].eq("OBSERVED_NOT_VALIDATED").any():
                 st.caption("엔진 출력은 관측 결과이며, 별도 라벨링된 정답 차트와 대조되지 않은 항목은 검증 완료로 간주하지 않습니다.")
 
