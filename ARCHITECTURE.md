@@ -70,3 +70,8 @@ Streamlit pages (display only; no inline trading rules)
 - `data/regression/manifest.csv` stores known problem scenarios. Dates and expected values intentionally remain blank until chart-reviewed.
 - `tools/run_historical_regression.py` emits `NEEDS_LABEL`, `MISSING_OHLCV`, `INVALID_OHLCV`, `OBSERVED_NOT_VALIDATED`, `PASS`, or `FAIL`. Only user-labelled expected values can yield PASS/FAIL.
 - `docs/legacy_db_inventory/` records 56 static query-operation call sites across 14 literal/dynamic table-or-RPC targets from the reviewed legacy source. Live schema, permissions, and row-level security remain unknown.
+
+
+## Live Monitor boundary
+
+`dashboard_v2/services/live_monitor_service.py` validates provisional Yahoo Finance 5-minute OHLCV, checks the XNYS session and timestamp freshness, and computes same-time cumulative intraday relative volume. It is isolated from the official daily-bar engine: Live Monitor reads official pattern/candidate pivot/breakout pivot/stage from `screening_service.analyze_symbol` using completed daily bars, then compares the latest intraday observation without writing official state or events. During regular hours a missing current-session bar or a bar older than 15 minutes disables live signal interpretation. Outside regular hours the page labels observations `MARKET CLOSED`. Intraday relative volume is explicitly not official EOD RVOL and cannot confirm a breakout.

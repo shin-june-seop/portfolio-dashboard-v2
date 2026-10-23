@@ -1,11 +1,11 @@
-# Portfolio Dashboard V2 — Phase 4: Core Screen Integration
+# Portfolio Dashboard V2 — Watchlist + Live Monitor
 
 This is a clean-room rebuild, not a refactor of the legacy monolithic `app.py`. The legacy app is used only to inventory data requirements and preserve regression examples. The current milestone connects the shared chronological engine to Momentum Monitor and Pattern Scanner; it does not claim that every legacy screen or live DB integration is complete.
 
 ## Current state
 
 - V2-only authenticated watchlist CRUD (`public.v2_watchlist`) is the first persistent user-data feature. It uses a clean, separate Supabase project, email/password sign-in, row-level security, and no legacy-data import. See `WATCHLIST_SETUP.md`.
-- Enabled watchlist symbols are the shared source for Momentum Monitor and Pattern Scanner. The next planned stage is a separate intraday Live Monitor; PP Journal follows after that.
+- Enabled watchlist symbols are the shared source for Momentum Monitor, Live Monitor, and Pattern Scanner. Live Monitor consumes provisional Yahoo Finance 5-minute bars separately from the official completed-daily-bar engine. PP Journal remains the next planned phase.
 
 Implemented and unit-tested:
 - Canonical OHLCV normalization and data validation.
@@ -26,7 +26,7 @@ Implemented and unit-tested:
 - Yahoo Finance is approved for V2 EOD analysis under the explicit policy in `DATA_SOURCE_POLICY.md`; upstream values may be revised and this is not an automatic-trading approval.
 - Broad historical pattern-label validation and a cloud browser smoke test for each deployed revision.
 - Watchlist persistence requires the user to create a new empty Supabase project and configure Streamlit Cloud secrets.
-- Live Monitor and PP Journal persistence are not implemented yet; they are the next planned phases.
+- Live Monitor is implemented as a read-only intraday view; it does not persist live state or official events. PP Journal persistence remains a future phase.
 
 Pattern thresholds are initial automation heuristics from Functional Spec v0.12, not universal chart-pattern truths. V2 is not a production trade-signal system yet.
 
@@ -119,7 +119,7 @@ In the sidebar, choose a data source explicitly. `Yahoo Finance (EOD)` fetches s
 
 ### Streamlit Community Cloud
 
-Deploy this repository/project folder with `app.py` as the entry point. Cloud installation uses `requirements.txt`. No Supabase secrets are required for this phase because both core screens are read-only and use market-data bars. Supabase/portfolio records are not yet connected. Yahoo Finance remains an external source whose values may be revised. Price-source and completed-bar policies are documented in `DATA_SOURCE_POLICY.md`; the app stays read-only and no automatic orders are submitted.
+Deploy this repository with `app.py` as the entry point. Cloud installation uses `requirements.txt`. Supabase is required for the authenticated V2 Watchlist; configure `SUPABASE_URL` and `SUPABASE_ANON_KEY` in Streamlit Secrets, using only the public anon/publishable key. Live Monitor additionally fetches provisional Yahoo Finance 5-minute bars and uses the last completed EOD output as its pattern/pivot baseline. Yahoo values may be delayed, incomplete, or revised. Live calculations never overwrite official EOD stage/history; stale data disables live signals, and the app stays read-only with no automatic orders.
 
 ### Historical state note
 

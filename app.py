@@ -7,11 +7,21 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import streamlit as st
 
 from dashboard_v2.services.screening_service import analyze_symbol, load_seed_snapshots
+from dashboard_v2.services.live_monitor_service import (
+    NY as LIVE_NY,
+    YFinanceIntradayProvider,
+    assess_live_data_status,
+    classify_live_state,
+    crossed_pivot_this_session,
+    live_session_metrics,
+)
 from dashboard_v2.services.watchlist_repository import (
     active_tickers,
     add_watchlist_item,
@@ -24,7 +34,7 @@ from dashboard_v2.services.watchlist_repository import (
 
 ROOT = Path(__file__).resolve().parent
 PAGES = [
-    "Watchlist", "Momentum Monitor", "Quality Recovery", "Pattern Scanner", "PP Journal",
+    "Watchlist", "Momentum Monitor", "Live Monitor", "Quality Recovery", "Pattern Scanner", "PP Journal",
     "Overview", "Holdings", "Market Regime", "App Monitor", "ADD Monitor",
     "Performance", "Allocation", "Chart", "Leaders",
 ]
@@ -36,6 +46,12 @@ st.set_page_config(page_title="Portfolio Dashboard V2", page_icon="📊", layout
 def _load_yfinance_bars(symbol: str) -> pd.DataFrame:
     from dashboard_v2.services.yfinance_provider import YFinanceDailyProvider
     return YFinanceDailyProvider(history_days=5 * 365).daily_bars(symbol)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_live_intraday_bars(symbol: str) -> pd.DataFrame:
+    """Provisional 5-minute bars for Live Monitor only; never pass these to EOD engines."""
+    return YFinanceIntradayProvider().intraday_bars(symbol)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -187,6 +203,254 @@ def _num_or_none(value):
     return None if value is None or pd.isna(value) else float(value)
 
 
+def _pivot_distance(price: float | None, pivot: float | None):
+    if price is None or pivot is None or pd.isna(price) or pd.isna(pivot):
+        return None
+    try:
+        price_value, pivot_value = float(price), float(pivot)
+    except (TypeError, ValueError):
+        return None
+    if price_value <= 0 or pivot_value <= 0:
+        return None
+    return (price_value / pivot_value - 1.0) * 100.0
+
+
+def _previous_completed_close_before_session(daily_bars: pd.DataFrame | None, session_date):
+    """Return the last completed daily close strictly before the intraday session date."""
+    if daily_bars is None or daily_bars.empty or "Date" not in daily_bars or "Close" not in daily_bars:
+        return None
+    dates = pd.to_datetime(daily_bars["Date"], errors="coerce")
+    frame = daily_bars.loc[dates.dt.date < session_date].copy()
+    if frame.empty:
+        return None
+    try:
+        value = float(frame.iloc[-1]["Close"])
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 and pd.notna(value) else None
+
+
+def _live_source_status(status_code: str) -> str:
+    return {
+        "LIVE": "LIVE · 5분 데이터 정상",
+        "DATA_STALE": "DATA STALE · 신호 비활성",
+        "DATA_INCOMPLETE": "DATA INCOMPLETE · 신호 비활성",
+        "MARKET_CLOSED": "MARKET CLOSED · 마지막 세션 데이터",
+    }.get(status_code, f"{status_code} · 신호 비활성")
+
+
+def _render_live_monitor_page(symbols: list[str]) -> None:
+    st.subheader("Live Monitor")
+    st.caption("장중 관찰 전용 화면입니다. 실시간 가격/누적 거래량은 공식 EOD 패턴·피봇·Stage 기록을 변경하지 않습니다.")
+    st.warning(
+        "데이터 공급원: Yahoo Finance 5분봉(잠정). 실시간·거래소 원천 데이터가 보장되지 않으며 지연/누락될 수 있습니다. "
+        "LIVE 표시도 실제 주문 신호가 아니며 주문은 제출하지 않습니다."
+    )
+    with st.expander("계산 기준 및 안전장치", expanded=False):
+        st.markdown(
+            "- **공식 ENTRY STAGE / Pattern / Candidate Pivot / Breakout Pivot:** 기존 완료 일봉 공통 엔진의 결과만 사용합니다.\n"
+            "- **LIVE STATE:** 마지막 장중 5분봉과 공식 EOD 피봇을 비교한 임시 상태입니다. 장중 이탈은 공식 `BREAKOUT FAILURE`로 기록하지 않습니다.\n"
+            "- **장중 RVOL:** 현재 세션 누적 5분 거래량 ÷ 직전 최대 5개 세션의 같은 시각까지 누적 거래량 평균입니다. 최소 3개 기준 세션이 없으면 `—`로 둡니다.\n"
+            "- 장중 RVOL은 공식 EOD RVOL과 다른 지표이며 `BREAKOUT CONFIRMED` 판정에 사용하지 않습니다.\n"
+            "- 정규장 중 최신 봉이 15분보다 오래됐거나 당일 봉이 없으면 `DATA STALE`로 표시하고 LIVE 신호를 비활성화합니다. 정규장 종료 후에는 `MARKET CLOSED`로 표시합니다."
+        )
+
+    if not symbols:
+        st.info("활성 관심종목이 없습니다. Watchlist에서 종목을 추가하거나 활성화해 주세요.")
+        return
+
+    refresh_col, info_col = st.columns([1, 3])
+    if refresh_col.button("장중 데이터 새로고침", type="primary", key="v2_live_refresh"):
+        _load_live_intraday_bars.clear()
+        st.rerun()
+    info_col.caption("장중 데이터 캐시: 최대 60초 · 공식 완료 일봉 기준 데이터 캐시: 최대 15분")
+
+    with st.spinner(f"{len(symbols)}개 종목의 완료 일봉 기준선과 장중 데이터를 확인 중…"):
+        eod_result, daily_raw, eod_errors, elapsed = _run_scan(symbols, "Yahoo Finance (EOD)")
+
+    eod_by_symbol: dict[str, dict] = {}
+    if not eod_result.empty:
+        eod_by_symbol = {
+            str(row["ticker"]): row.to_dict()
+            for _, row in eod_result.iterrows()
+        }
+
+    now = datetime.now(tz=LIVE_NY)
+    bars_by_symbol: dict[str, pd.DataFrame] = {}
+    live_rows: list[dict] = []
+    live_errors: list[tuple[str, str]] = []
+
+    def load_intraday_one(symbol: str):
+        try:
+            return symbol, _load_live_intraday_bars(symbol), None
+        except Exception as exc:
+            return symbol, None, f"{type(exc).__name__}: {exc}"
+
+    # A small bounded pool avoids a long serial wait for larger watchlists.
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(symbols)))) as pool:
+        futures = {pool.submit(load_intraday_one, symbol): symbol for symbol in symbols}
+        intraday_results = [future.result() for future in as_completed(futures)]
+
+    for symbol, intraday_bars, fetch_error in intraday_results:
+        baseline = eod_by_symbol.get(symbol)
+        if fetch_error or intraday_bars is None or intraday_bars.empty:
+            live_errors.append((symbol, fetch_error or "LiveMarketDataError: no intraday bars"))
+            live_rows.append({
+                "ticker": symbol, "live_price": None, "change_pct": None, "session_volume": None,
+                "live_rvol": None, "candidate_pivot": None, "candidate_distance_pct": None,
+                "breakout_pivot": None, "breakout_distance_pct": None, "live_state": "DATA INCOMPLETE",
+                "data_status": "DATA INCOMPLETE · 신호 비활성", "last_bar_at": None, "bar_age_min": None,
+                "eod_pattern": (baseline or {}).get("pattern", "—"),
+                "eod_stage": (baseline or {}).get("stage", "—"), "eod_as_of_date": (baseline or {}).get("as_of_date", "—"),
+                "source": "오류",
+            })
+            continue
+
+        bars_by_symbol[symbol] = intraday_bars
+        try:
+            status = assess_live_data_status(intraday_bars, now=now)
+            metrics = live_session_metrics(intraday_bars)
+            latest_stamp = pd.Timestamp(intraday_bars["Date"].iloc[-1]).tz_convert(LIVE_NY)
+            session_date = latest_stamp.date()
+            live_price = metrics.get("last_price")
+            daily_bars = daily_raw.get(symbol)
+            previous_close = _previous_completed_close_before_session(daily_bars, session_date)
+            change_pct = _pivot_distance(live_price, previous_close)
+            candidate_pivot = (baseline or {}).get("candidate_pivot")
+            breakout_pivot = (baseline or {}).get("breakout_pivot")
+            active_cycle = bool((baseline or {}).get("breakout_cycle_active", False))
+            eod_baseline_ok = baseline is not None and previous_close is not None
+            if not eod_baseline_ok:
+                state = "DATA INCOMPLETE · EOD 기준선 없음"
+                display_status = "DATA INCOMPLETE · 신호 비활성"
+            elif status.code == "DATA_STALE":
+                state = "DATA STALE · LIVE 신호 비활성"
+                display_status = _live_source_status(status.code)
+            elif status.code == "DATA_INCOMPLETE":
+                state = "DATA INCOMPLETE · LIVE 신호 비활성"
+                display_status = _live_source_status(status.code)
+            else:
+                crossed = crossed_pivot_this_session(intraday_bars, candidate_pivot, now=now)
+                calculated_state = classify_live_state(
+                    live_price=live_price,
+                    candidate_pivot=candidate_pivot,
+                    breakout_pivot=breakout_pivot,
+                    breakout_cycle_active=active_cycle,
+                    candidate_crossed_today=crossed,
+                )
+                state = f"마지막 세션: {calculated_state}" if status.code == "MARKET_CLOSED" else calculated_state
+                display_status = _live_source_status(status.code)
+
+            candidate_distance = _pivot_distance(live_price, candidate_pivot)
+            breakout_distance = _pivot_distance(live_price, breakout_pivot)
+            rvol = metrics.get("live_rvol")
+            rvol_display = None if rvol is None else float(rvol)
+            live_rows.append({
+                "ticker": symbol,
+                "live_price": live_price,
+                "change_pct": change_pct,
+                "session_volume": metrics.get("session_volume"),
+                "live_rvol": rvol_display,
+                "live_rvol_reference_sessions": metrics.get("reference_sessions", 0),
+                "candidate_pivot": candidate_pivot,
+                "candidate_distance_pct": candidate_distance,
+                "breakout_pivot": breakout_pivot,
+                "breakout_distance_pct": breakout_distance,
+                "live_state": state,
+                "data_status": display_status,
+                "last_bar_at": latest_stamp.strftime("%Y-%m-%d %H:%M ET"),
+                "bar_age_min": status.age_minutes,
+                "eod_pattern": (baseline or {}).get("pattern", "—"),
+                "eod_stage": (baseline or {}).get("stage", "—"),
+                "eod_as_of_date": (baseline or {}).get("as_of_date", "—"),
+                "source": "Yahoo Finance 5m",
+                "_status_code": status.code,
+            })
+        except Exception as exc:
+            live_errors.append((symbol, f"Live analysis {type(exc).__name__}: {exc}"))
+            live_rows.append({
+                "ticker": symbol, "live_price": None, "change_pct": None, "session_volume": None,
+                "live_rvol": None, "candidate_pivot": None, "candidate_distance_pct": None,
+                "breakout_pivot": None, "breakout_distance_pct": None, "live_state": "DATA INCOMPLETE",
+                "data_status": "DATA INCOMPLETE · 신호 비활성", "last_bar_at": None, "bar_age_min": None,
+                "eod_pattern": (baseline or {}).get("pattern", "—"),
+                "eod_stage": (baseline or {}).get("stage", "—"), "eod_as_of_date": (baseline or {}).get("as_of_date", "—"),
+                "source": "오류",
+            })
+
+    frame = pd.DataFrame(live_rows)
+    if frame.empty:
+        st.error("Live Monitor 결과가 없습니다.")
+        return
+
+    fresh_n = int(frame.get("_status_code", pd.Series(dtype=str)).eq("LIVE").sum()) if "_status_code" in frame else 0
+    limited_symbols = set(frame.loc[
+        frame["data_status"].astype(str).str.startswith(("DATA STALE", "DATA INCOMPLETE")), "ticker"
+    ].astype(str))
+    limited_symbols.update(symbol for symbol, _ in live_errors)
+    stale_n = len(limited_symbols)
+    market_closed = any("MARKET CLOSED" in str(value) for value in frame["data_status"])
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("관심종목", len(symbols))
+    k2.metric("LIVE 데이터 정상", fresh_n)
+    k3.metric("데이터 제한/오류", stale_n)
+    k4.metric("EOD 계산", f"{elapsed:.1f}s")
+    if market_closed and fresh_n == 0:
+        st.info("미국 정규장이 닫혀 있습니다. 마지막 장중 데이터와 공식 EOD 상태만 참고용으로 표시합니다. 실시간 신호는 비활성입니다.")
+    if eod_errors:
+        with st.expander(f"완료 일봉 기준선 오류 ({len(eod_errors)})", expanded=False):
+            st.dataframe(pd.DataFrame(eod_errors, columns=["종목", "오류"]), use_container_width=True, hide_index=True)
+
+    display = frame.copy()
+    display["현재/마지막 가격"] = display["live_price"].map(_fmt_num)
+    display["직전 완료 일봉 대비"] = display["change_pct"].map(lambda x: "—" if x is None or pd.isna(x) else f"{x:+.2f}%")
+    display["장중 누적 거래량"] = display["session_volume"].map(lambda x: "—" if x is None or pd.isna(x) else f"{int(x):,}")
+    display["LIVE RVOL"] = display.apply(
+        lambda row: "—" if pd.isna(row.get("live_rvol")) else f"{float(row['live_rvol']):.2f}× (n={int(row.get('live_rvol_reference_sessions', 0))})",
+        axis=1,
+    )
+    display["Candidate Pivot"] = display["candidate_pivot"].map(_fmt_num)
+    display["후보 피봇 거리"] = display["candidate_distance_pct"].map(lambda x: "—" if x is None or pd.isna(x) else f"{x:+.2f}%")
+    display["Breakout Pivot"] = display["breakout_pivot"].map(_fmt_num)
+    display["돌파 피봇 거리"] = display["breakout_distance_pct"].map(lambda x: "—" if x is None or pd.isna(x) else f"{x:+.2f}%")
+    display["공식 EOD Pattern"] = display.get("eod_pattern", pd.Series("—", index=display.index)).fillna("—")
+    display["공식 EOD Stage"] = display["eod_stage"]
+    display["EOD 기준일"] = display["eod_as_of_date"].fillna("—")
+    display["데이터 상태"] = display["data_status"]
+    display["마지막 5분봉"] = display["last_bar_at"].fillna("—")
+    columns = [
+        "ticker", "현재/마지막 가격", "직전 완료 일봉 대비", "장중 누적 거래량", "LIVE RVOL",
+        "공식 EOD Pattern", "Candidate Pivot", "후보 피봇 거리", "Breakout Pivot", "돌파 피봇 거리",
+        "live_state", "공식 EOD Stage", "EOD 기준일", "데이터 상태", "마지막 5분봉",
+    ]
+    st.dataframe(
+        display[columns].rename(columns={"ticker": "종목", "live_state": "LIVE STATE"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    available = [symbol for symbol in symbols if symbol in bars_by_symbol]
+    if available:
+        st.markdown("#### 장중 차트 및 기준선")
+        selected = st.selectbox("종목", available, key="v2_live_detail_symbol")
+        live_bars = bars_by_symbol[selected].copy()
+        live_bars["Date"] = pd.to_datetime(live_bars["Date"])
+        live_bars = live_bars.set_index("Date")
+        eod_row = eod_by_symbol.get(selected, {})
+        candidate = eod_row.get("candidate_pivot")
+        breakout = eod_row.get("breakout_pivot")
+        live_chart = live_bars[["Close"]].rename(columns={"Close": "5분봉 종가"}).tail(120).copy()
+        if candidate is not None and pd.notna(candidate):
+            live_chart["Candidate Pivot · EOD"] = float(candidate)
+        if breakout is not None and pd.notna(breakout):
+            live_chart["Breakout Pivot · EOD"] = float(breakout)
+        st.line_chart(live_chart, height=300)
+        st.caption("피봇선은 완료 일봉 엔진에서 가져온 고정 기준선입니다. 장중 차트로 패턴·피봇을 재계산하지 않습니다.")
+
+    if live_errors:
+        with st.expander(f"장중 데이터/계산 오류 ({len(live_errors)})", expanded=bool(live_errors)):
+            st.dataframe(pd.DataFrame(live_errors, columns=["종목", "오류"]), use_container_width=True, hide_index=True)
+
+
 def _save_auth_session(session) -> None:
     if session is None:
         return
@@ -284,7 +548,7 @@ def _require_v2_login():
 
 def _render_watchlist_page(client, user_id: str, rows: list[dict]) -> None:
     st.subheader("관심종목 관리")
-    st.caption("V2 전용 신규 목록입니다. 기존 관심종목이나 거래 기록은 가져오지 않았습니다. 활성 종목만 Momentum Monitor/Pattern Scanner 분석 대상에 포함됩니다.")
+    st.caption("V2 전용 신규 목록입니다. 기존 관심종목이나 거래 기록은 가져오지 않았습니다. 활성 종목만 Momentum Monitor/Live Monitor/Pattern Scanner의 분석 대상에 포함됩니다.")
 
     with st.expander("➕ 관심종목 추가", expanded=not rows):
         with st.form("v2_watchlist_add_form", clear_on_submit=True):
@@ -372,7 +636,7 @@ except Exception as exc:
 symbols = active_tickers(watchlist_rows)
 
 st.sidebar.title("Portfolio Dashboard V2")
-st.sidebar.caption("V2 clean data · personal watchlist · shared EOD engine")
+st.sidebar.caption("V2 clean data · personal watchlist · shared EOD + isolated LIVE layer")
 page = st.sidebar.radio("화면", PAGES, index=0)
 st.sidebar.caption(f"관심종목 {len(watchlist_rows)}개 · 분석 활성 {len(symbols)}개")
 st.sidebar.caption(st.session_state.get("_v2_supabase_user_email", getattr(auth_user, "email", "")))
@@ -384,17 +648,22 @@ if st.sidebar.button("로그아웃", key="v2_logout"):
     _clear_auth_session()
     st.rerun()
 st.sidebar.divider()
-st.sidebar.markdown("**시장 데이터**")
-source = st.sidebar.selectbox(
-    "데이터 공급원",
-    ["연결 안 함 (기본)", "Yahoo Finance (EOD)", "Bundled regression data (historical)"],
-    index=0,
-    help="미국 거래소의 가장 최근 완료 일봉만 사용합니다. 패턴/피봇은 auto_adjust=False OHLC, 다기간 수익률과 RS는 split·배당 조정 Adj Close 기준입니다. 완료 일봉이 없거나 데이터가 불완전하면 해당 종목을 표시하지 않습니다.",
-)
-if source == "Yahoo Finance (EOD)":
-    st.sidebar.info("EOD 정책 확정: auto_adjust=False OHLC로 패턴/피봇, Adj Close로 다기간 수익률·RS, RVOL은 당일 완료 거래량 ÷ 직전 20개 완료 일봉 평균. 미국 동부시간 16:15 전에는 당일 봉을 제외합니다.")
-elif source == "Bundled regression data (historical)":
-    st.sidebar.info("고정된 과거 검증 데이터입니다. 현재 시세가 아닙니다.")
+if page == "Live Monitor":
+    source = "Yahoo Finance (EOD)"
+    st.sidebar.markdown("**Live Monitor 데이터**")
+    st.sidebar.info("별도 5분봉 잠정 공급원 + 완료 일봉 기준선. EOD 패턴/피봇 엔진과 장중 계산을 분리합니다.")
+else:
+    st.sidebar.markdown("**시장 데이터**")
+    source = st.sidebar.selectbox(
+        "데이터 공급원",
+        ["연결 안 함 (기본)", "Yahoo Finance (EOD)", "Bundled regression data (historical)"],
+        index=0,
+        help="미국 거래소의 가장 최근 완료 일봉만 사용합니다. 패턴/피봇은 auto_adjust=False OHLC, 다기간 수익률과 RS는 split·배당 조정 Adj Close 기준입니다. 완료 일봉이 없거나 데이터가 불완전하면 해당 종목을 표시하지 않습니다.",
+    )
+    if source == "Yahoo Finance (EOD)":
+        st.sidebar.info("EOD 정책 확정: auto_adjust=False OHLC로 패턴/피봇, Adj Close로 다기간 수익률·RS, RVOL은 당일 완료 거래량 ÷ 직전 20개 완료 일봉 평균. 미국 동부시간 16:15 전에는 당일 봉을 제외합니다.")
+    elif source == "Bundled regression data (historical)":
+        st.sidebar.info("고정된 과거 검증 데이터입니다. 현재 시세가 아닙니다.")
 
 st.title("Portfolio Dashboard V2")
 st.caption("기준 명세: Functional Spec v0.12 · 기존 앱/DB와 분리 · 읽기 전용 분석")
@@ -405,13 +674,16 @@ if page == "Watchlist":
     except Exception as exc:
         st.error(f"관심종목 화면 오류: {type(exc).__name__}: {exc}")
 
+elif page == "Live Monitor":
+    _render_live_monitor_page(symbols)
+
 elif page in {"Momentum Monitor", "Pattern Scanner"}:
     if source == "연결 안 함 (기본)":
         st.subheader(page)
         st.info("왼쪽에서 데이터 공급원을 선택하면 공통 재베이스·패턴·피봇 엔진이 종목을 분석합니다. 기본 상태에서는 임의의 시세나 신호를 표시하지 않습니다.")
         st.markdown("**이 화면에서 사용하는 공통 엔진**")
         st.write("완료 일봉 → 날짜순 재베이스 상태 → 단일 주 패턴/후보 피봇 → 역사적 Breakout Pivot → EOD Stage → 거리/RVOL/모멘텀")
-        st.caption("Yahoo Finance EOD 정책: 완료된 미국 일봉만 사용합니다. 당일 가격 변동이 필요한 기능은 추후 별도 Live Monitor로 분리합니다.")
+        st.caption("Yahoo Finance EOD 정책: 완료된 미국 일봉만 사용합니다. 장중 가격/누적 거래량은 별도 Live Monitor에서 분리해 확인합니다.")
     elif not symbols:
         st.warning("활성 관심종목이 없습니다. 화면 왼쪽의 Watchlist에서 종목을 추가하거나 비활성화 여부를 확인하세요.")
     else:
@@ -465,9 +737,10 @@ elif page == "App Monitor":
         ("날짜순 재베이스/패턴/피봇 재생", "구현·테스트"),
         ("Momentum Monitor 공통 엔진 연결", "구현"),
         ("Pattern Scanner 공통 엔진 연결", "구현"),
-        ("Yahoo Finance 공급원", "EOD 데이터 정책 적용 · 외부 데이터 정정 가능"),
+        ("Live Monitor 장중 5분봉 + freshness guard", "구현·테스트 · Yahoo 잠정 공급원"),
+        ("Yahoo Finance 공급원", "EOD 정책 적용 · 장중 데이터는 별도 잠정 공급원"),
         ("7개 회귀 종목 과거 스냅샷", "포함·정답 라벨은 미검증"),
-        ("V2 전용 Supabase Watchlist + RLS", "연결 필요: 신규 프로젝트/Secrets 설정"),
+        ("V2 전용 Supabase Watchlist + RLS", "연결됨 · 사용자별 RLS"),
         ("나머지 화면 전체 기능 이관", "후속 구현"),
         ("주문 제출/자동 매매", "미구현·비활성"),
     ]
@@ -477,11 +750,11 @@ elif page == "App Monitor":
 elif page == "Overview":
     st.subheader("Overview")
     st.write("V2는 새로 입력한 관심종목으로 시작합니다. 실제 보유 포지션과 거래 기록은 아직 별도 구현 대상입니다.")
-    st.metric("핵심 화면 연결", "Momentum Monitor + Pattern Scanner")
+    st.metric("핵심 화면 연결", "Momentum + Live + Pattern")
     st.caption("핵심 우선순위는 Momentum Monitor → Live Monitor → PP Journal입니다. Overview/Holdings 등은 후순위입니다.")
 else:
     st.subheader(page)
     st.info("이 화면은 메뉴를 유지하고 있습니다. 기능 명세서에 따라 후속 단계에서 실제 데이터/기능을 연결합니다. 현재 화면은 아직 기능 이관이 완료되지 않았습니다.")
 
 st.divider()
-st.caption("운영 안전장치: 새 V2 전용 DB만 사용 · RLS 사용자별 분리 · 완료 일봉 EOD 분석 · 주문 제출 없음 · 기존 DB 데이터 미사용 · Yahoo 원천 데이터 정정 가능")
+st.caption("운영 안전장치: 새 V2 전용 DB만 사용 · RLS 사용자별 분리 · 완료 일봉 EOD 분석과 장중 LIVE 분리 · 오래된 데이터는 신호 비활성 · 주문 제출 없음 · 기존 DB 데이터 미사용 · Yahoo 원천 데이터 정정 가능")
