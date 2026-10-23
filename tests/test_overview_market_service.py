@@ -125,10 +125,12 @@ def test_sidebar_removes_separate_market_regime_page_but_keeps_market_monitor_he
     assert 'elif page == "Market Regime"' not in source
 
 
-def test_overview_route_renders_market_panels_and_explains_market_regime_location():
+def test_overview_route_renders_intraday_market_panels_and_explains_market_regime_location():
     from pathlib import Path
 
     source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
     assert 'elif page == "Overview":' in source
-    assert "render_overview_market_panels_html(overview_panels)" in source
+    assert "_render_overview_intraday_cards()" in source
+    assert '@st.fragment(run_every=\"5m\")' in source
+    assert "build_intraday_index_figure(panel)" in source
     assert "Market Score와 Market Regime은 Momentum Monitor 상단" in source
