@@ -5,3 +5,4 @@ yfinance>=0.2
 pytest>=8.0
 exchange-calendars>=4.5,<5
 supabase>=2.0,<3.0
+plotly>=5.22,<7

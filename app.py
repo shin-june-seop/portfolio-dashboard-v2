@@ -44,9 +44,12 @@ from dashboard_v2.services.market_regime_service import (
     compute_market_regime,
     market_metrics_from_bars,
 )
-from dashboard_v2.services.overview_market_service import (
-    load_overview_market_panels,
-    render_overview_market_panels_html,
+from dashboard_v2.services.overview_intraday_service import (
+    INDEX_INTRADAY_CONFIGS,
+    build_intraday_index_figure,
+    build_intraday_index_panel,
+    fetch_intraday_index_bars,
+    render_intraday_index_header_html,
 )
 from dashboard_v2.services.watchlist_repository import (
     active_tickers,
@@ -179,10 +182,48 @@ def _load_market_regime_bars(symbol: str) -> pd.DataFrame:
 
 
 
-@st.cache_data(ttl=15 * 60, show_spinner=False)
-def _load_overview_market_panels() -> list[dict[str, Any]]:
-    """Three compact index cards; EOD price data only, ETF volume as explicit proxy."""
-    return load_overview_market_panels()
+@st.cache_data(ttl=180, show_spinner=False)
+def _load_overview_intraday_bars(symbol: str) -> tuple[pd.DataFrame, str, str]:
+    """Cached legacy-style 5-minute index feed, separate from every EOD engine."""
+    return fetch_intraday_index_bars(symbol)
+
+
+@st.fragment(run_every="5m")
+def _render_overview_intraday_cards() -> None:
+    """Render the legacy V50.53 3-card intraday index overview."""
+    st.markdown("---")
+    columns = st.columns(3, gap="large")
+    for column, config in zip(columns, INDEX_INTRADAY_CONFIGS):
+        label = config["label"]
+        symbol = config["symbol"]
+        with column:
+            raw, method, fetch_error = _load_overview_intraday_bars(symbol)
+            panel = build_intraday_index_panel(
+                raw, label=label, symbol=symbol, fetch_error=fetch_error
+            )
+            panel["method"] = method
+            if not panel.get("available"):
+                st.markdown(
+                    f"<div style='background:#20242b;border:1px solid #46505f;border-radius:8px;"
+                    f"padding:12px;color:#9aa3b2'><b>{label}</b><br>"
+                    f"장중 데이터 없음 · {panel.get('error', 'DATA_UNAVAILABLE')}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                continue
+            st.markdown(render_intraday_index_header_html(panel), unsafe_allow_html=True)
+            figure = build_intraday_index_figure(panel)
+            st.plotly_chart(
+                figure,
+                use_container_width=True,
+                config={"displayModeBar": False, "responsive": True},
+                key=f"v2_overview_index_{symbol}",
+            )
+    st.caption(
+        "S&P 500 · NASDAQ · DOW: Yahoo Finance 5분봉 기반, 전일 정규장 종가 대비 변화. "
+        "카드는 5분마다 갱신됩니다. 상대거래량은 각 지수에 공급된 장중 거래량을 과거 동일 시간대와 비교한 보조 지표이며, "
+        "데이터가 없으면 임의의 RVOL을 표시하지 않습니다. 이 화면은 읽기 전용이며 공식 EOD 패턴·피봇·Stage를 변경하지 않습니다."
+    )
 
 
 @st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
@@ -1537,31 +1578,9 @@ elif page == "App Monitor":
 
 elif page == "Overview":
     st.subheader("Overview")
-    st.caption("주요 미국 지수 · 최근 2개 완료 일봉 · 장중 미완성 봉 제외")
-    with st.spinner("S&P 500 · NASDAQ · DOW 완료 일봉을 불러오는 중…"):
-        overview_panels = _load_overview_market_panels()
-    st.components.v1.html(
-        render_overview_market_panels_html(overview_panels),
-        height=388,
-        scrolling=False,
-    )
-    failed_panels = [panel for panel in overview_panels if not panel.get("available")]
-    if failed_panels:
-        with st.expander(f"지수 데이터 상태 ({len(failed_panels)}개 사용 불가)", expanded=False):
-            st.dataframe(
-                pd.DataFrame([
-                    {"지수": panel.get("label"), "심볼": panel.get("symbol"),
-                     "상태": panel.get("error") or "DATA_UNAVAILABLE"}
-                    for panel in failed_panels
-                ]),
-                use_container_width=True, hide_index=True,
-            )
-    st.caption(
-        "가격 캔들은 Yahoo Finance의 완료 일봉 OHLC(auto_adjust=False)를 사용합니다. "
-        "상대거래량은 각 지수의 ETF 프록시(SPY / QQQ / DIA)에서 직전 20개 완료 일봉 평균 대비로 계산하며, "
-        "지수 가격·공식 Stage·Market Regime 점수 계산에는 섞지 않습니다."
-    )
-    st.info("Market Score와 Market Regime은 Momentum Monitor 상단에서 확인할 수 있습니다. 이 오버뷰 차트는 시각적 시장 요약이며 개별 종목의 공식 Entry Stage를 변경하지 않습니다.")
+    st.caption("시장 장중 흐름 · S&P 500 / NASDAQ / DOW · 5분봉 · 전일 종가 대비 변화")
+    _render_overview_intraday_cards()
+    st.info("Market Score와 Market Regime은 Momentum Monitor 상단에서 확인할 수 있습니다. 이 오버뷰는 장중 시장 시각화이며 개별 종목의 공식 Entry Stage·패턴·피봇을 변경하지 않습니다.")
     st.divider()
     st.write("V2는 새로 입력한 관심종목으로 시작합니다. 실제 보유 포지션과 거래 기록은 별도 화면에서 관리합니다.")
     st.metric("핵심 화면 연결", "Momentum + Live + PP Journal")
