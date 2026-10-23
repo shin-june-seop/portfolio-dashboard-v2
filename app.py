@@ -44,6 +44,10 @@ from dashboard_v2.services.market_regime_service import (
     compute_market_regime,
     market_metrics_from_bars,
 )
+from dashboard_v2.services.overview_market_service import (
+    load_overview_market_panels,
+    render_overview_market_panels_html,
+)
 from dashboard_v2.services.watchlist_repository import (
     active_tickers,
     add_watchlist_item,
@@ -57,7 +61,7 @@ from dashboard_v2.services.watchlist_repository import (
 ROOT = Path(__file__).resolve().parent
 PAGES = [
     "Watchlist", "Momentum Monitor", "Live Monitor", "Quality Recovery", "Pattern Scanner", "PP Journal",
-    "Overview", "Holdings", "Market Regime", "App Monitor", "ADD Monitor",
+    "Overview", "Holdings", "App Monitor", "ADD Monitor",
     "Performance", "Allocation", "Chart", "Leaders",
 ]
 
@@ -171,6 +175,14 @@ def _load_market_regime_bars(symbol: str) -> pd.DataFrame:
     """Load complete daily market bars for broad-market regime only."""
     from dashboard_v2.services.yfinance_provider import YFinanceDailyProvider
     return YFinanceDailyProvider(history_days=5 * 365).daily_bars(symbol)
+
+
+
+
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def _load_overview_market_panels() -> list[dict[str, Any]]:
+    """Three compact index cards; EOD price data only, ETF volume as explicit proxy."""
+    return load_overview_market_panels()
 
 
 @st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
@@ -1525,9 +1537,34 @@ elif page == "App Monitor":
 
 elif page == "Overview":
     st.subheader("Overview")
-    st.write("V2는 새로 입력한 관심종목으로 시작합니다. 실제 보유 포지션과 거래 기록은 아직 별도 구현 대상입니다.")
-    st.metric("핵심 화면 연결", "Momentum + Live + Pattern")
-    st.caption("핵심 우선순위는 Momentum Monitor → Live Monitor → PP Journal입니다. Overview/Holdings 등은 후순위입니다.")
+    st.caption("주요 미국 지수 · 최근 2개 완료 일봉 · 장중 미완성 봉 제외")
+    with st.spinner("S&P 500 · NASDAQ · DOW 완료 일봉을 불러오는 중…"):
+        overview_panels = _load_overview_market_panels()
+    st.components.v1.html(
+        render_overview_market_panels_html(overview_panels),
+        height=388,
+        scrolling=False,
+    )
+    failed_panels = [panel for panel in overview_panels if not panel.get("available")]
+    if failed_panels:
+        with st.expander(f"지수 데이터 상태 ({len(failed_panels)}개 사용 불가)", expanded=False):
+            st.dataframe(
+                pd.DataFrame([
+                    {"지수": panel.get("label"), "심볼": panel.get("symbol"),
+                     "상태": panel.get("error") or "DATA_UNAVAILABLE"}
+                    for panel in failed_panels
+                ]),
+                use_container_width=True, hide_index=True,
+            )
+    st.caption(
+        "가격 캔들은 Yahoo Finance의 완료 일봉 OHLC(auto_adjust=False)를 사용합니다. "
+        "상대거래량은 각 지수의 ETF 프록시(SPY / QQQ / DIA)에서 직전 20개 완료 일봉 평균 대비로 계산하며, "
+        "지수 가격·공식 Stage·Market Regime 점수 계산에는 섞지 않습니다."
+    )
+    st.info("Market Score와 Market Regime은 Momentum Monitor 상단에서 확인할 수 있습니다. 이 오버뷰 차트는 시각적 시장 요약이며 개별 종목의 공식 Entry Stage를 변경하지 않습니다.")
+    st.divider()
+    st.write("V2는 새로 입력한 관심종목으로 시작합니다. 실제 보유 포지션과 거래 기록은 별도 화면에서 관리합니다.")
+    st.metric("핵심 화면 연결", "Momentum + Live + PP Journal")
 else:
     st.subheader(page)
     st.info("이 화면은 메뉴를 유지하고 있습니다. 기능 명세서에 따라 후속 단계에서 실제 데이터/기능을 연결합니다. 현재 화면은 아직 기능 이관이 완료되지 않았습니다.")
