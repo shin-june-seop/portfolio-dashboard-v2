@@ -15,12 +15,11 @@ import pandas as pd
 import streamlit as st
 
 from dashboard_v2.services.screening_service import analyze_symbol, load_seed_snapshots
-from dashboard_v2.engines.quality_recovery_engine import (
-    analyze_quality_recovery,
-)
-from dashboard_v2.services.sec_fundamentals_provider import (
-    analyze_company_facts, empty_fundamental_result,
-    fetch_sec_json, load_ticker_cik_map, resolve_ticker_cik, valid_sec_user_agent,
+from dashboard_v2.services.quality_recovery_service import (
+    analyze_legacy_quality_recovery,
+    fetch_yfinance_fundamentals,
+    fundamentals_from_income_statement,
+    quality_recovery_table,
 )
 from dashboard_v2.services.live_monitor_service import (
     NY as LIVE_NY,
@@ -64,6 +63,42 @@ def _load_yfinance_bars(symbol: str) -> pd.DataFrame:
     return YFinanceDailyProvider(history_days=5 * 365).daily_bars(symbol)
 
 
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _load_adjusted_close_history(symbol: str) -> pd.DataFrame:
+    """Load dividend/split-adjusted daily closes for legacy V30.5 RS only.
+
+    These values are never passed into the technical moving-average or pivot
+    calculations. The same completed-US-session cutoff as the V2 EOD layer is
+    applied before returning them.
+    """
+    import yfinance as yf
+
+    ticker = yf.Ticker(str(symbol).upper().strip())
+    raw = ticker.history(period="2y", interval="1d", auto_adjust=True, actions=False, timeout=15)
+    if raw is None or raw.empty or "Close" not in raw.columns:
+        return pd.DataFrame(columns=["Date", "Close"])
+    idx = pd.DatetimeIndex(pd.to_datetime(raw.index))
+    idx_et = idx.tz_convert("America/New_York") if idx.tz is not None else idx
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    row_dates = [stamp.date() for stamp in idx_et]
+    cutoff_time = pd.Timestamp("16:15").time()
+    if now_et.time().replace(tzinfo=None) < cutoff_time:
+        keep = [day < now_et.date() for day in row_dates]
+    else:
+        keep = [day <= now_et.date() for day in row_dates]
+    values = pd.to_numeric(raw["Close"], errors="coerce")
+    out = pd.DataFrame({"Date": pd.to_datetime(row_dates), "Close": values.to_numpy()})
+    out = out.loc[keep].dropna(subset=["Date", "Close"]).copy()
+    out = out.drop_duplicates("Date", keep="last").sort_values("Date").reset_index(drop=True)
+    return out
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def _load_quality_fundamentals(symbol: str) -> dict[str, Any]:
+    """Legacy-compatible annual Yahoo income-statement gate; no SEC dependency."""
+    return fetch_yfinance_fundamentals(symbol)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _load_live_intraday_bars(symbol: str) -> pd.DataFrame:
     """Provisional 5-minute bars for Live Monitor only; never pass these to EOD engines."""
@@ -76,21 +111,6 @@ def _load_regression_bars(symbol: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"No bundled regression OHLCV for {symbol}")
     return pd.read_csv(path)
-
-
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def _load_sec_ticker_map(user_agent: str) -> dict[str, list[dict[str, Any]]]:
-    """SEC's public ticker/CIK map; cached daily to limit requests."""
-    return load_ticker_cik_map(user_agent)
-
-
-@st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
-def _load_sec_company_facts(cik: int, user_agent: str) -> dict[str, Any]:
-    """Per-company SEC XBRL facts; cache to avoid repeated EDGAR downloads."""
-    return fetch_sec_json(
-        f"https://data.sec.gov/api/xbrl/companyfacts/CIK{int(cik):010d}.json",
-        user_agent,
-    )
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -1052,185 +1072,131 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
 
 
 
-def _sec_user_agent_from_secrets() -> str:
-    """Read the SEC contact header without ever displaying or logging it."""
-    try:
-        value = st.secrets.get("SEC_USER_AGENT", "")
-    except Exception:
-        value = ""
-    return str(value or "").strip()
-
-
-def _review_fundamental_row(symbol: str, reason: str, *, status: str = "REVIEW") -> dict[str, Any]:
-    return empty_fundamental_result(symbol, reason, status=status)
-
-
-def _load_fundamentals_for_watchlist(symbols: list[str], source: str) -> tuple[dict[str, dict[str, Any]], list[tuple[str, str]]]:
-    """Fetch latest SEC fundamentals only for current Yahoo EOD analysis.
-
-    Historical bundled price replays are deliberately not paired with current
-    SEC facts, which would mix reference dates and imply false point-in-time data.
-    """
-    results: dict[str, dict[str, Any]] = {}
-    errors: list[tuple[str, str]] = []
-    if not symbols:
-        return results, errors
-    if source != "Yahoo Finance (EOD)":
-        for symbol in symbols:
-            results[symbol] = _review_fundamental_row(
-                symbol, "NOT_PAIRED_WITH_HISTORICAL_BUNDLED_PRICE_DATA", status="NOT_ASSESSED"
-            )
-        return results, errors
-
-    user_agent = _sec_user_agent_from_secrets()
-    if not valid_sec_user_agent(user_agent):
-        for symbol in symbols:
-            results[symbol] = _review_fundamental_row(symbol, "SEC_USER_AGENT_NOT_CONFIGURED")
-        return results, errors
-
-    try:
-        ticker_map = _load_sec_ticker_map(user_agent)
-    except Exception as exc:
-        reason = f"SEC_TICKER_MAP_FETCH_FAILED:{type(exc).__name__}"
-        for symbol in symbols:
-            results[symbol] = _review_fundamental_row(symbol, reason)
-        errors.append(("SEC ticker map", f"{type(exc).__name__}: {exc}"))
-        return results, errors
-
-    for symbol in symbols:
-        cik, company_name, mapping_error = resolve_ticker_cik(symbol, ticker_map)
-        if mapping_error:
-            results[symbol] = _review_fundamental_row(symbol, mapping_error)
-            continue
-        try:
-            company_facts = _load_sec_company_facts(int(cik), user_agent)
-            results[symbol] = analyze_company_facts(symbol, int(cik), company_name or "", company_facts)
-        except Exception as exc:
-            reason = f"SEC_COMPANY_FACTS_FETCH_FAILED:{type(exc).__name__}"
-            results[symbol] = _review_fundamental_row(symbol, reason)
-            errors.append((symbol, f"{type(exc).__name__}: {exc}"))
-    return results, errors
-
-
 def _render_quality_recovery_page(symbols: list[str], source: str) -> None:
-    """Read-only technical recovery scan plus a conservative SEC fundamentals gate."""
-    st.subheader("Quality Recovery")
-    st.caption(
-        "완료 일봉 기반 기술적 회복과 SEC에 보고된 분기 EPS·매출 성장을 별도 평가합니다. "
-        "어느 쪽도 주문이나 공식 ENTRY STAGE를 생성·변경하지 않습니다."
-    )
+    """Render the legacy V30 Quality Recovery Radar on the V2 watchlist/EOD layer."""
+    st.subheader("🧬 Quality Recovery Radar")
+    st.caption("Watchlist가 Single Source of Truth입니다. 활성 관심종목만 평가하며, 이 화면은 공식 ENTRY STAGE나 주문을 생성·변경하지 않습니다.")
+    st.info("진행 단계 참고: **접근중 → 테스트 → 지지 반등** 또는 **접근중 → 이탈 → 무너짐 → 회복 시도 → 회복 확정 → 리테스트 → 리테스트 확인 → 추세 회복**")
+    st.caption("120MA = 중기 추세 회복 경로 · 200MA = 장기 추세 회복 경로. 이벤트 판정 방식은 동일하며, 200MA 이벤트를 더 중요하게 봅니다.")
+    st.caption("RS Engine V30.5 호환 · QQQ 대비 21/63/126/252 거래일 상대강도 · Momentum Monitor 및 다른 엔진의 공식 Stage와 분리")
+
     if source == "연결 안 함 (기본)":
-        st.info("왼쪽에서 Yahoo Finance (EOD) 또는 Bundled regression data (historical)를 선택하면 분석합니다. 임의의 시세/신호는 표시하지 않습니다.")
+        st.info("왼쪽에서 Yahoo Finance (EOD)를 선택하면 기존 Quality Recovery 방식으로 분석합니다. 임의의 시세나 펀더멘털 판정은 표시하지 않습니다.")
         return
     if not symbols:
         st.warning("활성 관심종목이 없습니다. Watchlist에서 종목을 추가하거나 활성화하세요.")
         return
 
-    user_agent = _sec_user_agent_from_secrets()
-    if source == "Yahoo Finance (EOD)" and not valid_sec_user_agent(user_agent):
-        st.warning(
-            "SEC 펀더멘털 조회가 설정되지 않았습니다. Streamlit App settings → Secrets에 "
-            '`SEC_USER_AGENT = "PortfolioDashboardV2 contact: 실제_이메일"` 을 추가하세요. '
-            "설정 전에는 Fundamental Gate를 통과 처리하지 않고 REVIEW로 유지합니다."
-        )
-    elif source == "Bundled regression data (historical)":
-        st.warning("과거 번들 가격 데이터와 현재 SEC 공시를 혼합하지 않으므로 펀더멘털은 NOT_ASSESSED입니다.")
-
     result_rows: list[dict[str, Any]] = []
     raw_by_symbol: dict[str, pd.DataFrame] = {}
+    adjusted_by_symbol: dict[str, pd.DataFrame] = {}
     errors: list[tuple[str, str]] = []
-    with st.spinner(f"{len(symbols)}개 관심종목의 완료 일봉 회복 상태를 계산 중…"):
+    benchmark_bars: pd.DataFrame | None = None
+    benchmark_adjusted: pd.DataFrame | None = None
+
+    if source == "Yahoo Finance (EOD)":
+        try:
+            benchmark_bars = _load_bars("QQQ", source)
+        except Exception as exc:
+            errors.append(("QQQ benchmark", f"{type(exc).__name__}: {exc}"))
+        try:
+            benchmark_adjusted = _load_adjusted_close_history("QQQ")
+        except Exception as exc:
+            errors.append(("QQQ adjusted-close RS", f"{type(exc).__name__}: {exc}"))
+    elif source == "Bundled regression data (historical)":
+        st.warning("고정된 과거 가격 데이터에는 현재 연간 재무제표와 현재 RS를 결합하지 않습니다. 펀더멘털 및 RS는 미평가로 표시됩니다.")
+
+    with st.spinner(f"{len(symbols)}개 관심종목의 Quality Recovery를 분석 중…"):
         for symbol in symbols:
             try:
                 bars = _load_bars(symbol, source)
-                row = analyze_quality_recovery(symbol, bars)
-                result_rows.append(row)
                 raw_by_symbol[symbol] = bars
+                fundamental = fundamentals_from_income_statement(None)
+                adjusted = pd.DataFrame(columns=["Date", "Close"])
+                if source == "Yahoo Finance (EOD)":
+                    try:
+                        fundamental = _load_quality_fundamentals(symbol)
+                        if fundamental.get("fundamental_error"):
+                            errors.append((f"{symbol} fundamentals", str(fundamental["fundamental_error"])))
+                    except Exception as exc:
+                        errors.append((f"{symbol} fundamentals", f"{type(exc).__name__}: {exc}"))
+                    try:
+                        adjusted = _load_adjusted_close_history(symbol)
+                    except Exception as exc:
+                        errors.append((f"{symbol} adjusted-close RS", f"{type(exc).__name__}: {exc}"))
+                adjusted_by_symbol[symbol] = adjusted
+                row = analyze_legacy_quality_recovery(
+                    symbol,
+                    bars,
+                    fundamentals=fundamental,
+                    adjusted_close=adjusted,
+                    benchmark_adjusted_close=benchmark_adjusted,
+                    benchmark_bars=benchmark_bars,
+                )
+                result_rows.append(row)
             except Exception as exc:
                 errors.append((symbol, f"Technical {type(exc).__name__}: {exc}"))
 
-    # Fetch SEC fundamentals separately, then join by ticker. SEC failure must
-    # never discard valid technical analysis or turn an unavailable gate into PASS.
-    fundamentals, fundamental_errors = _load_fundamentals_for_watchlist(
-        list(raw_by_symbol.keys()), source
-    )
-    errors.extend(fundamental_errors)
-    for row in result_rows:
-        row.update(fundamentals.get(row["ticker"], _review_fundamental_row(row["ticker"], "FUNDAMENTAL_ROW_NOT_FOUND")))
+    if not result_rows:
+        st.error("Quality Recovery 데이터를 계산할 수 없습니다. 데이터 공급원과 일봉 이력을 확인하세요.")
+        if errors:
+            with st.expander(f"데이터/분석 오류 ({len(errors)})", expanded=True):
+                st.dataframe(pd.DataFrame(errors, columns=["종목", "오류"]), use_container_width=True, hide_index=True)
+        return
 
     result = pd.DataFrame(result_rows)
-    if not result.empty:
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("분석 종목", len(result))
-        c2.metric("Recovery Setup", int(result["recovery_setup"].sum()))
-        c3.metric("Recovery Cross 오늘", int(result["recovery_cross_today"].sum()))
-        c4.metric("Fundamental PASS", int((result["fundamental_gate_status"] == "PASS").sum()))
-        c5.metric("Fundamental REVIEW", int((result["fundamental_gate_status"] == "REVIEW").sum()))
+    display_table = quality_recovery_table(result_rows)
+    st.dataframe(display_table, use_container_width=True, hide_index=True)
+    st.caption("Quality Gate: EPS Growth > 0 + Sales Growth > 0 + 자동 감지된 Fundamental Damage 없음. Decline Reason은 참고용이며 매수 게이트가 아닙니다. Valuation / Analyst Target / Earnings Revision / Market Regime은 사용하지 않습니다.")
+    st.caption("기존 V50 Quality Recovery와 결과 호환을 위해 'EPS Growth'는 기존 코드와 동일하게 연간 Net Income 증가율을 사용합니다(실제 주당 EPS 증가율은 아님). Fundamental 데이터가 없으면 PASS하지 않고 CHECK로 표시합니다.")
 
-        view = result.copy()
-        view["가격"] = view["close"].map(lambda x: f"${x:,.2f}")
-        for col, label in (("sma20", "20D SMA"), ("sma50", "50D SMA"), ("sma120", "120D SMA"), ("sma200", "200D SMA")):
-            view[label] = view[col].map(lambda x: f"${x:,.2f}")
-        for col, label in (("distance_sma20_pct", "20D 거리"), ("distance_sma50_pct", "50D 거리"), ("distance_sma120_pct", "120D 거리"), ("distance_sma200_pct", "200D 거리")):
-            view[label] = view[col].map(lambda x: f"{x:+.2f}%")
-        view["Recovery Setup"] = view["recovery_setup"].map({True: "활성", False: "—"})
-        view["Recovery Cross (20↑50)"] = view["recovery_cross_today"].map({True: "오늘 발생", False: "—"})
-        view["Golden Cross (50↑200)"] = view["golden_cross_today"].map({True: "오늘 발생", False: "—"})
-        view["120D 재탈환"] = view["reclaimed_120d_today"].map({True: "오늘 발생", False: "—"})
-        view["200D 재탈환"] = view["reclaimed_200d_today"].map({True: "오늘 발생", False: "—"})
-        view["상태"] = view["recovery_state"]
-        view["EPS 성장 YoY"] = view["eps_growth_yoy_pct"].map(lambda x: "—" if x is None or pd.isna(x) else f"{x:+.1f}%")
-        view["매출 성장 YoY"] = view["revenue_growth_yoy_pct"].map(lambda x: "—" if x is None or pd.isna(x) else f"{x:+.1f}%")
-        view["Fundamental Gate"] = view["fundamental_gate_status"].map({
-            "PASS": "통과", "FAIL": "실패", "REVIEW": "검토 필요", "NOT_ASSESSED": "미평가"
-        }).fillna("검토 필요")
-        view["실적 점검"] = view["fundamental_damage_status"].map({"CLEAR": "훼손 신호 없음", "DETECTED": "요건 미충족", "REVIEW": "확인 불가"}).fillna("확인 불가")
-        cols = [
-            "ticker", "as_of_date", "가격", "20D SMA", "50D SMA", "120D SMA", "200D SMA",
-            "상태", "Recovery Setup", "Recovery Cross (20↑50)", "Golden Cross (50↑200)",
-            "120D 재탈환", "200D 재탈환", "EPS 성장 YoY", "매출 성장 YoY", "Fundamental Gate", "실적 점검",
-        ]
-        st.dataframe(
-            view[cols].rename(columns={"ticker": "종목", "as_of_date": "기술 기준일"}),
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.caption(
-            "PASS는 최신 비교 가능 분기의 EPS YoY 성장률과 매출 YoY 성장률이 모두 양수이고 보고 데이터가 신선할 때만 부여합니다. "
-            "FAIL은 확인 가능한 필수 조건 위반, REVIEW는 데이터 부족·비교 불가·오래된 공시입니다."
-        )
+    st.markdown("### 🔎 선택 종목 상세")
+    selected = st.selectbox("종목", result["ticker"].tolist(), key="quality_recovery_detail_symbol_v2")
+    row = next(item for item in result_rows if item["ticker"] == selected)
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("현재가", f"${row['price']:,.2f}")
+    metric2.metric("EPS Growth", f"{row['eps_growth']:+.1f}%" if pd.notna(row["eps_growth"]) else "—")
+    metric3.metric("Sales Growth", f"{row['sales_growth']:+.1f}%" if pd.notna(row["sales_growth"]) else "—")
+    metric4.metric("RS", f"{row['rs']:.0f}" if pd.notna(row["rs"]) else "—", f"{row['rs_delta']:+.1f}" if pd.notna(row["rs_delta"]) else None)
+    st.markdown(f"**현재 상태: {row['status']}** · Quality **{'PASS' if row['quality_gate'] else 'CHECK'}**")
+    left, right = st.columns(2)
+    for col, label, ma_key, event_key in (
+        (left, "120MA", "ma120", "e120"),
+        (right, "200MA", "ma200", "e200"),
+    ):
+        event = row[event_key]
+        distance = event.get("distance")
+        delta = event.get("delta")
+        with col:
+            st.markdown(f"**{label}**")
+            st.write(
+                f"현재 ${row[ma_key]:,.2f} · 이격 {distance:+.1f}% · "
+                f"이격 변화 {delta:+.1f}%p · **{event['state']}**"
+                if pd.notna(distance) and pd.notna(delta)
+                else f"현재 ${row[ma_key]:,.2f} · 데이터 부족"
+            )
+    st.write(
+        f"Correction {row['correction']:+.1f}% · Decline Reason(참고) {row['decline_reason']} · "
+        f"Fundamental {row['fundamental_direction']} · 훼손 판정 {row['fundamental_damage_status']}"
+    )
 
-        fundamentals_view = result.copy()
-        for col, label in (("eps_current_quarter", "최근 분기 EPS"), ("eps_prior_year_quarter", "전년 동기 EPS"), ("revenue_current_quarter", "최근 분기 매출"), ("revenue_prior_year_quarter", "전년 동기 매출")):
-            fundamentals_view[label] = fundamentals_view[col].map(lambda x: "—" if x is None or pd.isna(x) else f"{x:,.3f}" if "EPS" in label else f"${x:,.0f}")
-        fundamentals_view["상태"] = fundamentals_view["fundamental_gate_status"].map({"PASS": "통과", "FAIL": "실패", "REVIEW": "검토 필요", "NOT_ASSESSED": "미평가"}).fillna("검토 필요")
-        with st.expander("펀더멘털 상세 · 공시 데이터 출처", expanded=False):
-            fundamental_cols = [
-                "ticker", "sec_company_name", "sec_cik", "latest_fiscal_quarter_end", "latest_filing_date", "oldest_required_filing_date",
-                "최근 분기 EPS", "전년 동기 EPS", "EPS 성장 YoY", "최근 분기 매출", "전년 동기 매출", "매출 성장 YoY",
-                "eps_fact_tag", "revenue_fact_tag", "eps_component_status", "revenue_component_status",
-                "fundamental_data_status", "fundamental_report_age_days", "상태", "fundamental_gate_reason", "fundamental_damage_status",
-            ]
-            fundamentals_view["EPS 성장 YoY"] = fundamentals_view["eps_growth_yoy_pct"].map(lambda x: "—" if x is None or pd.isna(x) else f"{x:+.1f}%")
-            fundamentals_view["매출 성장 YoY"] = fundamentals_view["revenue_growth_yoy_pct"].map(lambda x: "—" if x is None or pd.isna(x) else f"{x:+.1f}%")
-            st.dataframe(fundamentals_view[[c for c in fundamental_cols if c in fundamentals_view.columns]], use_container_width=True, hide_index=True)
-            st.caption("EPS/매출은 SEC EDGAR Company Facts의 표준 XBRL 개념에서 추출한 보고 분기값입니다. 추정치가 아니며, 회사별 항목·회계기준 차이로 자료를 매칭하지 못하면 통과시키지 않습니다. 매출 금액은 USD 원단위 기준이며 화면에서는 천 단위 구분만 적용합니다.")
-
-        detail_symbol = st.selectbox("회복 상태 차트", result["ticker"].tolist(), key="quality_recovery_detail_symbol")
-        bars = raw_by_symbol[detail_symbol].copy()
-        bars["Date"] = pd.to_datetime(bars["Date"], errors="coerce")
-        bars = bars.sort_values("Date").copy()
-        close = pd.to_numeric(bars["Close"], errors="coerce")
-        chart = pd.DataFrame({"Close": close.to_numpy()}, index=bars["Date"])
+    bars = raw_by_symbol.get(selected)
+    if bars is not None and not bars.empty:
+        chart_bars = bars.copy()
+        chart_bars["Date"] = pd.to_datetime(chart_bars["Date"], errors="coerce")
+        chart_bars["Close"] = pd.to_numeric(chart_bars["Close"], errors="coerce")
+        chart_bars = chart_bars.dropna(subset=["Date", "Close"]).sort_values("Date")
+        chart = pd.DataFrame({"Close": chart_bars["Close"].to_numpy()}, index=chart_bars["Date"])
         for window in (20, 50, 120, 200):
-            chart[f"SMA{window}"] = close.rolling(window, min_periods=window).mean().to_numpy()
+            chart[f"SMA{window}"] = chart_bars["Close"].rolling(window, min_periods=window).mean().to_numpy()
         st.line_chart(chart.tail(260), height=340)
-        st.caption("차트는 완료 일봉 Close와 단순이동평균을 표시합니다. 배당 조정 Adj Close가 아니라 기술적 가격 기준 Close를 사용합니다.")
+        st.caption("차트의 Close 및 20/50/120/200일선은 완료 일봉의 기술적 가격을 사용합니다. 조정 종가는 RS 계산에만 별도로 사용합니다.")
 
     if errors:
-        with st.expander(f"데이터/분석 오류 ({len(errors)})", expanded=bool(result.empty)):
+        with st.expander(f"데이터/분석 오류 ({len(errors)})", expanded=False):
             st.dataframe(pd.DataFrame(errors, columns=["종목", "오류"]), use_container_width=True, hide_index=True)
-            st.caption("기술적 데이터 오류는 해당 종목의 기술 분석에서 제외합니다. SEC 조회 오류는 기술 분석을 유지하고 Fundamental Gate만 REVIEW로 둡니다.")
+            st.caption("가격 분석에 실패한 종목은 제외합니다. Yahoo 재무제표 또는 RS 조회 실패는 기술적 결과를 지우지 않으며 Quality는 CHECK로 유지합니다.")
+
 
 supabase_client, auth_user = _require_v2_login()
 user_id = str(auth_user.id)
@@ -1356,7 +1322,7 @@ elif page == "App Monitor":
         ("7개 회귀 종목 과거 스냅샷", "포함·정답 라벨은 미검증"),
         ("V2 전용 Supabase Watchlist + RLS", "연결됨 · 사용자별 RLS"),
         ("PP Signal / Trade / Add / Exit Journal", "V2 전용 append-only 테이블 · 수동 기록"),
-        ("Quality Recovery · SMA20/50/120/200 recovery scan", "구현·테스트 · 기술 신호만, 펀더멘털 Gate 미연결"),
+        ("Quality Recovery Radar · legacy V30 rules", "V2 Watchlist + Yahoo annual fundamentals + 120/200MA recovery + V30.5 RS"),
         ("나머지 화면 전체 기능 이관", "후속 구현"),
         ("주문 제출/자동 매매", "미구현·비활성"),
     ]
