@@ -15,6 +15,9 @@ import pandas as pd
 import streamlit as st
 
 from dashboard_v2.services.screening_service import analyze_symbol, load_seed_snapshots
+from dashboard_v2.engines.quality_recovery_engine import (
+    analyze_quality_recovery,
+)
 from dashboard_v2.services.live_monitor_service import (
     NY as LIVE_NY,
     YFinanceIntradayProvider,
@@ -1029,6 +1032,90 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
 
 
 
+
+def _render_quality_recovery_page(symbols: list[str], source: str) -> None:
+    """Read-only moving-average recovery scan; isolated from official pattern/stage logic."""
+    st.subheader("Quality Recovery")
+    st.caption(
+        "완료 일봉 기반 기술적 회복 상태만 표시합니다. Pattern/Pivot/Breakout/PP 엔진과 독립적이며 "
+        "이 화면은 Candidate Pivot이나 공식 ENTRY STAGE를 생성·변경하지 않습니다."
+    )
+    st.warning(
+        "펀더멘털 Gate는 아직 연결되지 않아 EPS 성장·매출 성장·실적 훼손 여부를 평가하지 않습니다. "
+        "따라서 Recovery Setup은 기술적 관찰 상태이지, ‘품질 통과’ 또는 매수 신호가 아닙니다."
+    )
+    if source == "연결 안 함 (기본)":
+        st.info("왼쪽에서 Yahoo Finance (EOD) 또는 Bundled regression data (historical)를 선택하면 분석합니다. 임의의 시세/신호는 표시하지 않습니다.")
+        return
+    if not symbols:
+        st.warning("활성 관심종목이 없습니다. Watchlist에서 종목을 추가하거나 활성화하세요.")
+        return
+
+    result_rows: list[dict[str, Any]] = []
+    raw_by_symbol: dict[str, pd.DataFrame] = {}
+    errors: list[tuple[str, str]] = []
+    with st.spinner(f"{len(symbols)}개 관심종목의 완료 일봉 회복 상태를 계산 중…"):
+        for symbol in symbols:
+            try:
+                bars = _load_bars(symbol, source)
+                row = analyze_quality_recovery(symbol, bars)
+                result_rows.append(row)
+                raw_by_symbol[symbol] = bars
+            except Exception as exc:
+                errors.append((symbol, f"{type(exc).__name__}: {exc}"))
+
+    result = pd.DataFrame(result_rows)
+    if not result.empty:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("분석 종목", len(result))
+        c2.metric("Recovery Setup", int(result["recovery_setup"].sum()))
+        c3.metric("Recovery Cross 오늘", int(result["recovery_cross_today"].sum()))
+        c4.metric("Golden Cross 오늘", int(result["golden_cross_today"].sum()))
+
+        view = result.copy()
+        view["가격"] = view["close"].map(lambda x: f"${x:,.2f}")
+        for col, label in (("sma20", "20D SMA"), ("sma50", "50D SMA"), ("sma120", "120D SMA"), ("sma200", "200D SMA")):
+            view[label] = view[col].map(lambda x: f"${x:,.2f}")
+        for col, label in (("distance_sma20_pct", "20D 거리"), ("distance_sma50_pct", "50D 거리"), ("distance_sma120_pct", "120D 거리"), ("distance_sma200_pct", "200D 거리")):
+            view[label] = view[col].map(lambda x: f"{x:+.2f}%")
+        view["Recovery Setup"] = view["recovery_setup"].map({True: "활성", False: "—"})
+        view["Recovery Cross (20↑50)"] = view["recovery_cross_today"].map({True: "오늘 발생", False: "—"})
+        view["Golden Cross (50↑200)"] = view["golden_cross_today"].map({True: "오늘 발생", False: "—"})
+        view["120D 재탈환"] = view["reclaimed_120d_today"].map({True: "오늘 발생", False: "—"})
+        view["200D 재탈환"] = view["reclaimed_200d_today"].map({True: "오늘 발생", False: "—"})
+        view["상태"] = view["recovery_state"]
+        view["펀더멘털"] = view["fundamental_gate_status"].map({"NOT_ASSESSED": "미평가"})
+        cols = [
+            "ticker", "as_of_date", "가격", "20D SMA", "50D SMA", "120D SMA", "200D SMA",
+            "20D 거리", "50D 거리", "120D 거리", "200D 거리", "상태", "Recovery Setup",
+            "Recovery Cross (20↑50)", "Golden Cross (50↑200)", "120D 재탈환", "200D 재탈환", "펀더멘털",
+        ]
+        st.dataframe(
+            view[cols].rename(columns={"ticker": "종목", "as_of_date": "기준일"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "Recovery Cross와 Golden Cross는 최신 완료 일봉에서 실제 상향 교차가 발생한 경우에만 표시됩니다. "
+            "MA 위에 있다는 사실 자체를 당일 교차 이벤트로 취급하지 않습니다."
+        )
+
+        detail_symbol = st.selectbox("회복 상태 차트", result["ticker"].tolist(), key="quality_recovery_detail_symbol")
+        bars = raw_by_symbol[detail_symbol].copy()
+        bars["Date"] = pd.to_datetime(bars["Date"], errors="coerce")
+        bars = bars.sort_values("Date").copy()
+        close = pd.to_numeric(bars["Close"], errors="coerce")
+        chart = pd.DataFrame({"Close": close.to_numpy()}, index=bars["Date"])
+        for window in (20, 50, 120, 200):
+            chart[f"SMA{window}"] = close.rolling(window, min_periods=window).mean().to_numpy()
+        st.line_chart(chart.tail(260), height=340)
+        st.caption("차트는 완료 일봉 Close와 단순이동평균을 표시합니다. 배당 조정 Adj Close가 아니라 기술적 가격 기준 Close를 사용합니다.")
+
+    if errors:
+        with st.expander(f"데이터/분석 오류 ({len(errors)})", expanded=bool(result.empty)):
+            st.dataframe(pd.DataFrame(errors, columns=["종목", "오류"]), use_container_width=True, hide_index=True)
+            st.caption("데이터가 부족하거나 불완전한 종목은 부분 MA를 기반으로 신호를 만들지 않고 결과에서 제외합니다.")
+
 supabase_client, auth_user = _require_v2_login()
 user_id = str(auth_user.id)
 try:
@@ -1081,6 +1168,9 @@ if page == "Watchlist":
 
 elif page == "Live Monitor":
     _render_live_monitor_page(symbols)
+
+elif page == "Quality Recovery":
+    _render_quality_recovery_page(symbols, source)
 
 elif page == "PP Journal":
     _render_pp_journal_page(supabase_client, user_id, symbols)
@@ -1150,6 +1240,7 @@ elif page == "App Monitor":
         ("7개 회귀 종목 과거 스냅샷", "포함·정답 라벨은 미검증"),
         ("V2 전용 Supabase Watchlist + RLS", "연결됨 · 사용자별 RLS"),
         ("PP Signal / Trade / Add / Exit Journal", "V2 전용 append-only 테이블 · 수동 기록"),
+        ("Quality Recovery · SMA20/50/120/200 recovery scan", "구현·테스트 · 기술 신호만, 펀더멘털 Gate 미연결"),
         ("나머지 화면 전체 기능 이관", "후속 구현"),
         ("주문 제출/자동 매매", "미구현·비활성"),
     ]
