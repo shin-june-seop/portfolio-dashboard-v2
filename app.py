@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 from datetime import datetime
+from typing import Any, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
@@ -21,6 +22,14 @@ from dashboard_v2.services.live_monitor_service import (
     classify_live_state,
     crossed_pivot_this_session,
     live_session_metrics,
+)
+from dashboard_v2.services.pp_journal_repository import (
+    ENTRY_STAGES, EXIT_REASONS, PPJournalValidationError,
+    add_pp_trade_add, add_pp_trade_exit, create_pp_trade,
+    list_pp_signals, list_pp_trades, list_trade_adds, list_trade_exits, save_pp_signals,
+)
+from dashboard_v2.services.pp_journal_analytics import (
+    analyze_pp_signal_outcome, summarize_trade, summarize_trades,
 )
 from dashboard_v2.services.watchlist_repository import (
     active_tickers,
@@ -624,6 +633,402 @@ def _render_watchlist_page(client, user_id: str, rows: list[dict]) -> None:
                 st.error(f"삭제 실패: {type(exc).__name__}: {exc}")
 
 
+def _pp_constructive_context(row: Mapping[str, Any]) -> bool:
+    if bool(row.get("detected_pattern_diagnostic")):
+        return True
+    close = _num_or_none(row.get("close"))
+    sma50 = _num_or_none(row.get("sma50"))
+    sma200 = _num_or_none(row.get("sma200"))
+    return close is not None and sma50 is not None and sma200 is not None and close > sma50 and sma50 >= sma200
+
+
+def _scan_pp_for_symbols(symbols: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[str, str]], float]:
+    if not symbols:
+        return [], [], [], 0.0
+    scan_frame, raw_by_symbol, errors, elapsed = _run_scan(symbols, "Yahoo Finance (EOD)")
+    valid_signals: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    if scan_frame.empty:
+        return valid_signals, diagnostics, errors, elapsed
+    from dashboard_v2.engines.pocket_pivot_engine import detect_pocket_pivot
+
+    for _, series in scan_frame.iterrows():
+        row = series.to_dict()
+        symbol = str(row.get("ticker", "")).upper()
+        bars = raw_by_symbol.get(symbol)
+        if bars is None or bars.empty:
+            diagnostics.append({"종목": symbol, "기준일": row.get("as_of_date"), "결과": "DATA INCOMPLETE"})
+            continue
+        try:
+            pp = detect_pocket_pivot(
+                bars,
+                constructive_context=_pp_constructive_context(row),
+                as_of_date=row.get("as_of_date"),
+            )
+        except Exception as exc:
+            diagnostics.append({"종목": symbol, "기준일": row.get("as_of_date"), "결과": f"ERROR: {type(exc).__name__}"})
+            continue
+        if not pp.valid_signal:
+            diagnostics.append({
+                "종목": symbol,
+                "기준일": row.get("as_of_date"),
+                "결과": " | ".join(pp.reason_codes),
+            })
+            continue
+        valid_signals.append({
+            "ticker": symbol,
+            "signal_date": (pp.as_of_date.isoformat() if pp.as_of_date else str(row.get("as_of_date", ""))[:10]),
+            "signal_price": _num_or_none(row.get("close")),
+            "signal_volume": pp.signal_volume,
+            "max_prior_down_day_volume": pp.max_prior_down_day_volume,
+            "reference_ma": pp.reference_ma,
+            "pattern_name": row.get("pattern") or "BASE FORMING / NO VALID PATTERN",
+            "entry_stage": row.get("stage") or "BASE",
+            "candidate_pivot": _num_or_none(row.get("candidate_pivot")),
+            "breakout_pivot": _num_or_none(row.get("breakout_pivot")),
+            "context_valid": bool(pp.context_valid),
+            "reason_codes": list(pp.reason_codes),
+            "valid_signal": bool(pp.valid_signal),
+        })
+    return valid_signals, diagnostics, errors, elapsed
+
+
+def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
+    from datetime import date
+    from dashboard_v2.services.pp_journal_repository import (
+        ENTRY_STAGES, EXIT_REASONS, PPJournalValidationError,
+        add_pp_trade_add, add_pp_trade_exit, create_pp_trade,
+        list_pp_signals, list_pp_trades, list_trade_adds, list_trade_exits,
+        save_pp_signals,
+    )
+    from dashboard_v2.services.pp_journal_analytics import (
+        analyze_pp_signal_outcome, summarize_trade, summarize_trades,
+    )
+
+    st.subheader("PP Journal")
+    st.caption("Pocket Pivot 신호와 실제 거래를 분리해 기록합니다. 거래 입력은 수동 기록이며 주문 제출·자동 청산은 하지 않습니다.")
+    with st.expander("저장·계산 기준", expanded=False):
+        st.markdown(
+            "- **PP Signal:** 완료 일봉 공통 엔진의 Pocket Pivot 조건을 통과한 이벤트만 저장합니다. 사용자·티커·신호일 조합으로 중복을 막고 당시 가격/거래량/피봇/Stage를 보존합니다.\n"
+            "- **Trade:** 최초 진입, 추가매수, 부분청산, 전량청산은 별도 행으로 추가됩니다. 최초 Stage와 진입 시점의 초기 손절선은 나중의 Stage 변화로 덮어쓰지 않습니다.\n"
+            "- **Position 상태:** OPEN은 청산 기록 없음, PARTIAL은 일부 청산 후 잔여 수량이 있음, CLOSED는 잔여 수량이 0인 경우에만 표시합니다. 예를 들어 90% 청산 후 10%가 남으면 PARTIAL입니다.\n"
+            "- **손익:** 청산 손익은 진입 건을 시간순으로 적용하는 FIFO 기준 참고치입니다. 세무/브로커 명세서와 별개의 저널 분석값입니다.\n"
+            "- **신호 후속 결과:** +10%/+20%, MFE/MAE, 저장 당시 Candidate Pivot의 고가 도달만 완료 일봉의 가격 움직임으로 측정합니다. 이는 공식 BREAKOUT/FAILURE 이벤트와 같지 않으며 그 이벤트 통계는 공식 날짜별 Stage 이벤트 원장과 연결된 뒤에만 표시합니다."
+        )
+
+    try:
+        saved_signals = list_pp_signals(client, user_id)
+        trades = list_pp_trades(client, user_id)
+        trade_ids = [str(row.get("id")) for row in trades]
+        all_adds = list_trade_adds(client, user_id, trade_ids)
+        all_exits = list_trade_exits(client, user_id, trade_ids)
+    except Exception as exc:
+        st.error(f"PP Journal 테이블을 읽을 수 없습니다: {type(exc).__name__}: {exc}")
+        st.info("새 V2 Supabase 프로젝트의 SQL Editor에서 `sql/v2_pp_journal_schema.sql`을 실행했는지 확인하세요. 기존 Watchlist SQL을 다시 실행할 필요는 없습니다.")
+        return
+
+    tab_signal, tab_trade, tab_analytics = st.tabs(["PP Signals", "실제 거래 기록", "성과 분석"])
+
+    with tab_signal:
+        st.markdown("#### 활성 관심종목에서 PP 신호 탐색")
+        if not symbols:
+            st.info("활성 관심종목이 없습니다. Watchlist에서 종목을 활성화해 주세요. 이미 저장된 신호와 거래 기록은 아래에 계속 보존됩니다.")
+        c1, c2 = st.columns([1, 3])
+        if c1.button("완료 일봉 PP 재스캔", type="primary", key="v2_pp_scan"):
+            if not symbols:
+                st.session_state["v2_pp_scan_results"] = []
+                st.session_state["v2_pp_scan_diagnostics"] = []
+                st.session_state["v2_pp_scan_errors"] = []
+            else:
+                with st.spinner(f"{len(symbols)}개 활성 관심종목의 완료 일봉 PP 조건을 확인 중…"):
+                    valid, diagnostics, errors, elapsed = _scan_pp_for_symbols(symbols)
+                st.session_state["v2_pp_scan_results"] = valid
+                st.session_state["v2_pp_scan_diagnostics"] = diagnostics
+                st.session_state["v2_pp_scan_errors"] = errors
+                st.session_state["v2_pp_scan_elapsed"] = elapsed
+            st.rerun()
+        c2.caption("현재 완료 일봉을 다시 계산합니다. 장중 5분봉은 신호 탐지/저장에 사용하지 않습니다.")
+
+        scan_results = st.session_state.get("v2_pp_scan_results", [])
+        if scan_results:
+            scan_view = pd.DataFrame(scan_results)
+            for col in ("signal_price", "candidate_pivot", "breakout_pivot"):
+                if col in scan_view:
+                    scan_view[col] = scan_view[col].map(lambda value: _fmt_num(value))
+            scan_view = scan_view.rename(columns={
+                "ticker": "종목", "signal_date": "신호일", "signal_price": "신호 가격",
+                "signal_volume": "신호일 거래량", "max_prior_down_day_volume": "직전 하락일 최대 거래량",
+                "reference_ma": "참조 MA", "pattern_name": "패턴", "entry_stage": "Stage",
+                "candidate_pivot": "저장 당시 Candidate Pivot", "breakout_pivot": "저장 당시 Breakout Pivot",
+            })
+            show_cols = [col for col in ["종목", "신호일", "신호 가격", "신호일 거래량", "직전 하락일 최대 거래량", "참조 MA", "패턴", "Stage", "저장 당시 Candidate Pivot", "저장 당시 Breakout Pivot"] if col in scan_view]
+            st.dataframe(scan_view[show_cols], use_container_width=True, hide_index=True)
+            if st.button("유효 PP 신호 저장", type="primary", key="v2_pp_save_signals"):
+                try:
+                    saved = save_pp_signals(client, user_id, scan_results)
+                    st.success(f"신규 저장 {saved['inserted']}건 · 중복으로 건너뜀 {saved['duplicates']}건")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"PP 신호 저장 실패: {type(exc).__name__}: {exc}")
+        elif "v2_pp_scan_results" in st.session_state:
+            st.info("현재 완료 일봉 기준으로 유효 PP 신호가 없습니다. 임의로 신호를 만들거나 이전 날짜 신호로 대체하지 않았습니다.")
+
+        scan_errors = st.session_state.get("v2_pp_scan_errors", [])
+        if scan_errors:
+            with st.expander(f"스캔 오류 ({len(scan_errors)})", expanded=False):
+                st.dataframe(pd.DataFrame(scan_errors, columns=["종목", "오류"]), use_container_width=True, hide_index=True)
+        rejected = st.session_state.get("v2_pp_scan_diagnostics", [])
+        if rejected:
+            with st.expander(f"PP 조건 미충족/진단 ({len(rejected)}종목)", expanded=False):
+                st.dataframe(pd.DataFrame(rejected), use_container_width=True, hide_index=True)
+
+        st.markdown("#### 저장된 PP Signal")
+        if saved_signals:
+            signal_view = pd.DataFrame(saved_signals)
+            signal_view = signal_view.rename(columns={
+                "ticker": "종목", "signal_date": "신호일", "signal_price": "신호 가격",
+                "signal_volume": "신호일 거래량", "max_prior_down_day_volume": "직전 하락일 최대 하락일 거래량",
+                "reference_ma": "참조 MA", "pattern_name": "당시 패턴", "entry_stage": "당시 Stage",
+                "candidate_pivot": "당시 Candidate Pivot", "breakout_pivot": "당시 Breakout Pivot",
+            })
+            cols = ["종목", "신호일", "신호 가격", "신호일 거래량", "직전 하락일 최대 하락일 거래량", "참조 MA", "당시 패턴", "당시 Stage", "당시 Candidate Pivot", "당시 Breakout Pivot"]
+            signal_view = signal_view[[c for c in cols if c in signal_view.columns]].copy()
+            for col in ("신호 가격", "당시 Candidate Pivot", "당시 Breakout Pivot"):
+                if col in signal_view:
+                    signal_view[col] = signal_view[col].map(lambda v: _fmt_num(v))
+            st.dataframe(signal_view, use_container_width=True, hide_index=True)
+        else:
+            st.caption("아직 저장된 PP 신호가 없습니다.")
+
+    with tab_trade:
+        st.markdown("#### 최초 진입 기록")
+        signal_options: dict[str, dict[str, Any] | None] = {"연결 안 함": None}
+        for sig in saved_signals:
+            label = f"{str(sig.get('signal_date',''))[:10]} · {sig.get('ticker')} · ${float(sig.get('signal_price') or 0):,.2f} · {str(sig.get('id',''))[:8]}"
+            signal_options[label] = sig
+        selected_signal_label = st.selectbox("연결할 PP Signal (선택)", list(signal_options.keys()), key="v2_pp_trade_signal_link")
+        selected_signal = signal_options[selected_signal_label]
+        ticker_options = list(dict.fromkeys(symbols + [str(s.get("ticker", "")) for s in saved_signals if s.get("ticker")]))
+        default_ticker = str((selected_signal or {}).get("ticker") or (ticker_options[0] if ticker_options else ""))
+        ticker = st.text_input("거래 티커", value=default_ticker, key=f"v2_pp_trade_ticker_{(selected_signal or {}).get('id','manual')}", help="PP Signal을 연결하면 해당 신호의 티커를 사용합니다.")
+        with st.form("v2_pp_create_trade_form", clear_on_submit=False):
+            a, b, c = st.columns(3)
+            default_price = float((selected_signal or {}).get("signal_price") or 1.0)
+            entry_price = a.number_input("최초 진입 가격", min_value=0.000001, value=max(0.000001, default_price), step=0.5, format="%.4f")
+            shares = b.number_input("최초 진입 수량 (주)", min_value=0.000001, value=1.0, step=1.0, format="%.6f")
+            weight = c.number_input("최초 진입 포트폴리오 비중 (%) · 선택", min_value=0.0, max_value=100.0, value=0.0, step=0.25, format="%.4f")
+            d, e, f = st.columns(3)
+            entry_date = d.date_input("최초 진입일", value=datetime.now(tz=LIVE_NY).date())
+            stage_default = str((selected_signal or {}).get("entry_stage") or "BASE")
+            stage_index = ENTRY_STAGES.index(stage_default) if stage_default in ENTRY_STAGES else 0
+            entry_stage = e.selectbox("최초 진입 Stage (고정 기록)", ENTRY_STAGES, index=stage_index)
+            initial_stop = f.number_input("최초 진입 당시 초기 손절선 · 선택", min_value=0.0, value=0.0, step=0.5, format="%.4f")
+            notes = st.text_area("거래 메모", max_chars=1500, placeholder="진입 이유, 셋업, 계획 등")
+            create_submitted = st.form_submit_button("최초 진입 기록 저장", type="primary", use_container_width=True)
+        if create_submitted:
+            trade_ticker = str((selected_signal or {}).get("ticker") or ticker).strip()
+            try:
+                created = create_pp_trade(
+                    client, user_id, ticker=trade_ticker,
+                    pp_signal_id=(selected_signal or {}).get("id"),
+                    initial_entry_date=entry_date, initial_entry_price=entry_price,
+                    initial_shares=shares, initial_weight_pct=(weight if weight > 0 else None),
+                    initial_entry_stage=entry_stage,
+                    initial_stop_price=(initial_stop if initial_stop > 0 else None), notes=notes,
+                )
+                st.success(f"{created['ticker']} 최초 진입을 기록했습니다. ID: {str(created['id'])[:8]}")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"거래 기록 저장 실패: {type(exc).__name__}: {exc}")
+
+        trade_summaries = []
+        for trade in trades:
+            tid = str(trade.get("id"))
+            trade_summaries.append(summarize_trade(
+                trade,
+                [row for row in all_adds if str(row.get("trade_id")) == tid],
+                [row for row in all_exits if str(row.get("trade_id")) == tid],
+            ))
+        if trade_summaries:
+            st.markdown("#### 포지션 현황")
+            table = pd.DataFrame(trade_summaries)
+            label_status = {"OPEN": "OPEN · 보유", "PARTIAL": "PARTIAL · 부분청산", "CLOSED": "CLOSED · 전량청산"}
+            table["status"] = table["status"].map(label_status)
+            table = table.rename(columns={
+                "ticker": "종목", "status": "상태", "initial_entry_date": "최초 진입일",
+                "initial_entry_stage": "최초 진입 Stage", "initial_entry_price": "최초 진입가",
+                "total_entered_shares": "총 매수 수량", "total_exited_shares": "총 청산 수량",
+                "remaining_shares": "잔여 수량", "average_remaining_cost": "잔여 수량 가중평균단가",
+                "realized_pnl": "실현손익 ($)", "realized_return_pct": "실현수익률 (%)",
+                "r_multiple": "R 배수", "adds_count": "추가매수 횟수", "exits_count": "청산 횟수",
+            })
+            show_cols = ["종목", "상태", "최초 진입일", "최초 진입 Stage", "최초 진입가", "총 매수 수량", "총 청산 수량", "잔여 수량", "잔여 수량 가중평균단가", "실현손익 ($)", "실현수익률 (%)", "R 배수", "추가매수 횟수", "청산 횟수"]
+            st.dataframe(table[[col for col in show_cols if col in table]], use_container_width=True, hide_index=True)
+
+            st.markdown("#### 선택 포지션 관리 — 추가매수 / 청산 기록")
+            trade_labels = {}
+            trade_by_label = {}
+            summary_by_id = {str(row["trade_id"]): row for row in trade_summaries}
+            for trade in trades:
+                summ = summary_by_id[str(trade["id"])]
+                label = f"{trade['ticker']} · {summ['status']} · 최초 {summ['initial_entry_date']} · {str(trade['id'])[:8]}"
+                trade_labels[label] = str(trade["id"])
+                trade_by_label[label] = trade
+            selected_trade_label = st.selectbox("관리할 포지션", list(trade_labels.keys()), key="v2_pp_manage_trade")
+            selected_trade = trade_by_label[selected_trade_label]
+            selected_id = str(selected_trade["id"])
+            selected_summary = summary_by_id[selected_id]
+            st.caption(
+                f"{selected_trade['ticker']} · 상태 {selected_summary['status']} · "
+                f"잔여 {selected_summary['remaining_shares']:.6g}주 · "
+                f"가중평균 잔여 단가 {_fmt_num(selected_summary['average_remaining_cost'])}"
+            )
+            add_col, exit_col = st.columns(2)
+            with add_col:
+                st.markdown("**추가매수 기록**")
+                with st.form(f"v2_pp_add_form_{selected_id}"):
+                    add_date = st.date_input("추가매수일", value=datetime.now(tz=LIVE_NY).date(), key=f"v2_pp_add_date_{selected_id}")
+                    add_price = st.number_input("추가매수 가격", min_value=0.000001, value=float(selected_summary["average_remaining_cost"] or selected_trade["initial_entry_price"]), step=0.5, format="%.4f", key=f"v2_pp_add_price_{selected_id}")
+                    add_shares = st.number_input("추가매수 수량", min_value=0.000001, value=1.0, step=1.0, format="%.6f", key=f"v2_pp_add_shares_{selected_id}")
+                    add_weight = st.number_input("추가매수 비중 (%) · 선택", min_value=0.0, max_value=100.0, value=0.0, step=0.25, format="%.4f", key=f"v2_pp_add_weight_{selected_id}")
+                    add_stage = st.selectbox("추가매수 Stage", ENTRY_STAGES, key=f"v2_pp_add_stage_{selected_id}")
+                    add_stop = st.number_input("추가매수 당시 초기 손절선 · 선택", min_value=0.0, value=0.0, step=0.5, format="%.4f", key=f"v2_pp_add_stop_{selected_id}")
+                    add_note = st.text_input("추가매수 메모", max_chars=1000, key=f"v2_pp_add_note_{selected_id}")
+                    add_submit = st.form_submit_button("추가매수 기록 저장", use_container_width=True)
+                if add_submit:
+                    try:
+                        add_pp_trade_add(
+                            client, user_id, selected_trade, entry_date=add_date,
+                            entry_price=add_price, shares=add_shares,
+                            portfolio_weight_pct=(add_weight if add_weight > 0 else None),
+                            entry_stage=add_stage, initial_stop_price=(add_stop if add_stop > 0 else None), note=add_note,
+                        )
+                        st.success("추가매수를 기록했습니다.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"추가매수 저장 실패: {type(exc).__name__}: {exc}")
+            with exit_col:
+                st.markdown("**부분청산 / 전량청산 기록**")
+                remaining_now = float(selected_summary["remaining_shares"])
+                with st.form(f"v2_pp_exit_form_{selected_id}"):
+                    exit_date = st.date_input("청산일", value=datetime.now(tz=LIVE_NY).date(), key=f"v2_pp_exit_date_{selected_id}")
+                    exit_price = st.number_input("청산 가격", min_value=0.000001, value=float(selected_summary["average_remaining_cost"] or selected_trade["initial_entry_price"]), step=0.5, format="%.4f", key=f"v2_pp_exit_price_{selected_id}")
+                    exit_shares = st.number_input("청산 수량", min_value=0.000001, max_value=max(0.000001, remaining_now), value=max(0.000001, remaining_now), step=1.0, format="%.6f", key=f"v2_pp_exit_shares_{selected_id}", disabled=remaining_now <= 0)
+                    reason_labels = {
+                        "돌파 실패": "BREAKOUT_FAILURE", "초기 손절": "INITIAL_STOP",
+                        "추적 손절": "TRAILING_STOP", "목표가/익절": "TAKE_PROFIT",
+                        "수동 청산": "MANUAL", "기타": "OTHER",
+                    }
+                    reason_label = st.selectbox("청산 사유", list(reason_labels.keys()), key=f"v2_pp_exit_reason_{selected_id}")
+                    exit_note = st.text_input("청산 메모", max_chars=1000, key=f"v2_pp_exit_note_{selected_id}")
+                    exit_submit = st.form_submit_button("청산 기록 저장", use_container_width=True, disabled=remaining_now <= 0)
+                if exit_submit:
+                    try:
+                        add_pp_trade_exit(
+                            client, user_id, selected_trade,
+                            exits=[row for row in all_exits if str(row.get("trade_id")) == selected_id],
+                            adds=[row for row in all_adds if str(row.get("trade_id")) == selected_id],
+                            exit_date=exit_date, exit_price=exit_price, shares=exit_shares,
+                            reason_code=reason_labels[reason_label], note=exit_note,
+                        )
+                        st.success("청산 내역을 추가했습니다. 잔여 수량이 남아 있으면 포지션은 계속 열려 있습니다.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"청산 기록 저장 실패: {type(exc).__name__}: {exc}")
+
+            with st.expander("선택 포지션의 원본 진입/청산 내역"):
+                selected_adds = [row for row in all_adds if str(row.get("trade_id")) == selected_id]
+                selected_exits = [row for row in all_exits if str(row.get("trade_id")) == selected_id]
+                fill_rows = [{
+                    "유형": "최초 진입", "날짜": selected_trade.get("initial_entry_date"),
+                    "가격": selected_trade.get("initial_entry_price"), "수량": selected_trade.get("initial_shares"),
+                    "Stage/사유": selected_trade.get("initial_entry_stage"), "초기 손절선": selected_trade.get("initial_stop_price"),
+                }]
+                fill_rows += [{"유형": "추가매수", "날짜": row.get("entry_date"), "가격": row.get("entry_price"), "수량": row.get("shares"), "Stage/사유": row.get("entry_stage"), "초기 손절선": row.get("initial_stop_price")} for row in selected_adds]
+                fill_rows += [{"유형": "청산", "날짜": row.get("exit_date"), "가격": row.get("exit_price"), "수량": row.get("shares"), "Stage/사유": row.get("reason_code"), "초기 손절선": None} for row in selected_exits]
+                st.dataframe(pd.DataFrame(fill_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("아직 거래 기록이 없습니다. 위에서 최초 진입부터 기록해 주세요. PP 신호를 연결하지 않고 수동 거래를 기록할 수도 있습니다.")
+
+    with tab_analytics:
+        trade_summaries = []
+        for trade in trades:
+            tid = str(trade.get("id"))
+            trade_summaries.append(summarize_trade(
+                trade,
+                [row for row in all_adds if str(row.get("trade_id")) == tid],
+                [row for row in all_exits if str(row.get("trade_id")) == tid],
+            ))
+        stats = summarize_trades(trade_summaries)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("전체 거래", stats["trade_count"])
+        m2.metric("OPEN / PARTIAL", f"{stats['open_count']} / {stats['partial_count']}")
+        m3.metric("CLOSED", stats["closed_count"])
+        m4.metric("승률 · 종료 거래", "—" if stats["win_rate_pct"] is None else f"{stats['win_rate_pct']:.1f}%")
+        m5, m6, m7, m8 = st.columns(4)
+        m5.metric("누적 실현손익 ($)", f"${stats['total_realized_pnl']:,.2f}")
+        m6.metric("평균 승리 수익률", "—" if stats["avg_win_pct"] is None else f"{stats['avg_win_pct']:+.2f}%")
+        m7.metric("평균 손실 수익률", "—" if stats["avg_loss_pct"] is None else f"{stats['avg_loss_pct']:+.2f}%")
+        m8.metric("Profit Factor", "—" if stats["profit_factor"] is None else f"{stats['profit_factor']:.2f}")
+        m9, m10, m11 = st.columns(3)
+        m9.metric("기대값 · 종료 거래 평균", "—" if stats["expectancy_pct"] is None else f"{stats['expectancy_pct']:+.2f}%")
+        m10.metric("평균 R 배수", "—" if stats["avg_r_multiple"] is None else f"{stats['avg_r_multiple']:+.2f}R")
+        m11.metric("PP Signal 누적", len(saved_signals))
+        st.caption("승률·평균 승패·Profit Factor·기대값은 CLOSED 거래만 사용합니다. OPEN/PARTIAL은 성과 분모에서 제외합니다. R 배수는 해당 진입 건의 초기 손절선이 기록된 거래에서만 계산됩니다.")
+
+        st.markdown("#### 저장 PP 신호의 후속 가격 움직임")
+        if not saved_signals:
+            st.caption("신호가 저장되면 완료 일봉의 이후 High/Low를 기준으로 MFE/MAE와 +10%/+20% 도달을 계산할 수 있습니다.")
+        else:
+            if st.button("후속 EOD 결과 재계산", key="v2_pp_revalue_outcomes"):
+                outcomes = []
+                errors = []
+                unique_symbols = list(dict.fromkeys(str(sig.get("ticker", "")).upper() for sig in saved_signals if sig.get("ticker")))
+                bars_cache: dict[str, pd.DataFrame] = {}
+                for symbol in unique_symbols:
+                    try:
+                        bars_cache[symbol] = _load_yfinance_bars(symbol)
+                    except Exception as exc:
+                        errors.append((symbol, f"{type(exc).__name__}: {exc}"))
+                for sig in saved_signals:
+                    outcome = analyze_pp_signal_outcome(sig, bars_cache.get(str(sig.get("ticker", "")).upper(), pd.DataFrame()))
+                    outcome["signal_price"] = sig.get("signal_price")
+                    outcome["candidate_pivot"] = sig.get("candidate_pivot")
+                    outcomes.append(outcome)
+                st.session_state["v2_pp_signal_outcomes"] = outcomes
+                st.session_state["v2_pp_signal_outcome_errors"] = errors
+                st.rerun()
+
+            outcomes = st.session_state.get("v2_pp_signal_outcomes", [])
+            if outcomes:
+                outcome_frame = pd.DataFrame(outcomes)
+                outcome_frame = outcome_frame.rename(columns={
+                    "ticker": "종목", "signal_date": "신호일", "signal_price": "신호 가격",
+                    "candidate_pivot": "저장 당시 Candidate Pivot", "candidate_pivot_touched": "피봇 고가 도달",
+                    "hit_plus_10_pct": "+10% 도달", "hit_plus_20_pct": "+20% 도달",
+                    "mfe_pct": "MFE (%)", "mae_pct": "MAE (%)", "observed_bars": "후속 완료 일봉 수",
+                    "outcome_status": "결과 상태",
+                })
+                wanted = ["종목", "신호일", "신호 가격", "저장 당시 Candidate Pivot", "피봇 고가 도달", "+10% 도달", "+20% 도달", "MFE (%)", "MAE (%)", "후속 완료 일봉 수", "결과 상태"]
+                outcome_frame = outcome_frame[[col for col in wanted if col in outcome_frame.columns]]
+                for col in ("신호 가격", "저장 당시 Candidate Pivot", "MFE (%)", "MAE (%)"):
+                    if col in outcome_frame:
+                        outcome_frame[col] = outcome_frame[col].map(lambda v: _fmt_num(v) if v is not None and pd.notna(v) else "—")
+                st.dataframe(outcome_frame, use_container_width=True, hide_index=True)
+                observed = [row for row in outcomes if row.get("outcome_status") == "OBSERVED_PRICE_EXCURSION"]
+                if observed:
+                    for label, key in (("저장 당시 피봇 고가 도달률", "candidate_pivot_touched"), ("+10% 도달률", "hit_plus_10_pct"), ("+20% 도달률", "hit_plus_20_pct")):
+                        values = [row.get(key) for row in observed if row.get(key) is not None]
+                        rate = sum(bool(x) for x in values) / len(values) * 100 if values else None
+                        st.metric(label, "—" if rate is None else f"{rate:.1f}%", help=f"결과가 관찰된 {len(values)}개 신호 기준. 저장 당시 후보 피봇이 없거나 후속 일봉이 없는 신호는 해당 비율의 분모에서 제외됩니다.")
+                st.caption("MFE/MAE는 신호일 다음 완료 일봉부터 계산합니다. 재베이스나 패턴 변경 이후에도 저장된 피봇선은 스냅샷으로 유지되며, 고가 도달을 공식 BREAKOUT으로 간주하지 않습니다.")
+            outcome_errors = st.session_state.get("v2_pp_signal_outcome_errors", [])
+            if outcome_errors:
+                with st.expander(f"후속 데이터 조회 오류 ({len(outcome_errors)})", expanded=False):
+                    st.dataframe(pd.DataFrame(outcome_errors, columns=["종목", "오류"]), use_container_width=True, hide_index=True)
+
+
+
 supabase_client, auth_user = _require_v2_login()
 user_id = str(auth_user.id)
 try:
@@ -666,7 +1071,7 @@ else:
         st.sidebar.info("고정된 과거 검증 데이터입니다. 현재 시세가 아닙니다.")
 
 st.title("Portfolio Dashboard V2")
-st.caption("기준 명세: Functional Spec v0.12 · 기존 앱/DB와 분리 · 읽기 전용 분석")
+st.caption("기준 명세: Functional Spec v0.12 · 기존 앱/DB와 분리 · EOD/LIVE 읽기 전용 분석 + 명시적 PP Journal 기록")
 
 if page == "Watchlist":
     try:
@@ -676,6 +1081,9 @@ if page == "Watchlist":
 
 elif page == "Live Monitor":
     _render_live_monitor_page(symbols)
+
+elif page == "PP Journal":
+    _render_pp_journal_page(supabase_client, user_id, symbols)
 
 elif page in {"Momentum Monitor", "Pattern Scanner"}:
     if source == "연결 안 함 (기본)":
@@ -741,11 +1149,12 @@ elif page == "App Monitor":
         ("Yahoo Finance 공급원", "EOD 정책 적용 · 장중 데이터는 별도 잠정 공급원"),
         ("7개 회귀 종목 과거 스냅샷", "포함·정답 라벨은 미검증"),
         ("V2 전용 Supabase Watchlist + RLS", "연결됨 · 사용자별 RLS"),
+        ("PP Signal / Trade / Add / Exit Journal", "V2 전용 append-only 테이블 · 수동 기록"),
         ("나머지 화면 전체 기능 이관", "후속 구현"),
         ("주문 제출/자동 매매", "미구현·비활성"),
     ]
     st.dataframe(pd.DataFrame(status_rows, columns=["기능", "상태"]), use_container_width=True, hide_index=True)
-    st.info("V2 전용 관심종목 CRUD만 신규 Supabase에 저장합니다. 기존 데이터는 가져오지 않으며, 보유종목·PP Journal 쓰기와 주문 제출은 아직 구현하지 않았습니다.")
+    st.info("관심종목과 PP Journal만 신규 V2 Supabase에 저장합니다. PP Signal과 실제 체결은 별도 테이블에 기록되며, 주문 제출/자동 매매는 구현하지 않았습니다.")
 
 elif page == "Overview":
     st.subheader("Overview")
