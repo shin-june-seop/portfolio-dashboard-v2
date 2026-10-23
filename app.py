@@ -12,12 +12,20 @@ import pandas as pd
 import streamlit as st
 
 from dashboard_v2.services.screening_service import analyze_symbol, load_seed_snapshots
+from dashboard_v2.services.watchlist_repository import (
+    active_tickers,
+    add_watchlist_item,
+    create_supabase_client,
+    delete_watchlist_item,
+    list_watchlist,
+    update_watchlist_item,
+    WatchlistValidationError,
+)
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_SYMBOLS = "AMAT, MU, SOXX, META, GOOG, STX, LRCX"
 PAGES = [
-    "Overview", "Holdings", "Market Regime", "Momentum Monitor", "App Monitor",
-    "Quality Recovery", "Pattern Scanner", "ADD Monitor", "PP Journal",
+    "Watchlist", "Momentum Monitor", "Quality Recovery", "Pattern Scanner", "PP Journal",
+    "Overview", "Holdings", "Market Regime", "App Monitor", "ADD Monitor",
     "Performance", "Allocation", "Chart", "Leaders",
 ]
 
@@ -179,9 +187,202 @@ def _num_or_none(value):
     return None if value is None or pd.isna(value) else float(value)
 
 
+def _save_auth_session(session) -> None:
+    if session is None:
+        return
+    access_token = getattr(session, "access_token", None)
+    refresh_token = getattr(session, "refresh_token", None)
+    if access_token and refresh_token:
+        st.session_state["_v2_supabase_access_token"] = access_token
+        st.session_state["_v2_supabase_refresh_token"] = refresh_token
+
+
+def _clear_auth_session() -> None:
+    st.session_state.pop("_v2_supabase_access_token", None)
+    st.session_state.pop("_v2_supabase_refresh_token", None)
+    st.session_state.pop("_v2_supabase_user_email", None)
+
+
+def _user_from_auth_response(response):
+    return getattr(response, "user", None)
+
+
+def _require_v2_login():
+    """Protect the public Streamlit app and only expose each user's own V2 rows."""
+    try:
+        supabase_url = str(st.secrets.get("SUPABASE_URL", "")).strip()
+        supabase_anon_key = str(st.secrets.get("SUPABASE_ANON_KEY", "")).strip()
+    except Exception:
+        supabase_url, supabase_anon_key = "", ""
+
+    if not supabase_url or not supabase_anon_key:
+        st.title("Portfolio Dashboard V2 · 최초 설정")
+        st.warning("V2 전용 Supabase 프로젝트 연결이 아직 설정되지 않았습니다.")
+        st.markdown("""
+이 대시보드는 공개 URL로 배포되므로, 관심종목을 보호하기 위해 로그인과 사용자별 RLS를 사용합니다.
+
+1. **새로운 빈 Supabase 프로젝트**를 만듭니다. 기존 프로젝트와 기존 데이터는 연결하지 않습니다.
+2. 저장소의 `sql/v2_watchlist_schema.sql`을 Supabase SQL Editor에서 실행합니다.
+3. Supabase **Authentication → Users**에서 본인 계정을 직접 생성하고, 공개 회원가입은 비활성화합니다.
+4. Streamlit Cloud의 앱 설정 → **Secrets**에 아래 두 값만 추가합니다. 키는 GitHub에 올리지 마세요.
+""")
+        st.code('SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"\nSUPABASE_ANON_KEY = "YOUR_PUBLIC_ANON_OR_PUBLISHABLE_KEY"', language="toml")
+        st.caption("service_role 키는 사용하지 않습니다. 로그인 후에는 사용자별 Row Level Security가 데이터 접근을 제한합니다.")
+        st.stop()
+
+    try:
+        client = create_supabase_client(supabase_url, supabase_anon_key)
+    except Exception as exc:
+        st.title("Portfolio Dashboard V2 · 연결 설정 확인")
+        st.error(f"Supabase 클라이언트를 만들지 못했습니다: {type(exc).__name__}: {exc}")
+        st.stop()
+
+    user = None
+    access = st.session_state.get("_v2_supabase_access_token")
+    refresh = st.session_state.get("_v2_supabase_refresh_token")
+    if access and refresh:
+        try:
+            restored = client.auth.set_session(access, refresh)
+            _save_auth_session(getattr(restored, "session", None) or restored)
+            user_response = client.auth.get_user()
+            user = getattr(user_response, "user", None)
+        except Exception:
+            _clear_auth_session()
+            user = None
+
+    if user is None:
+        st.title("Portfolio Dashboard V2 · 로그인")
+        st.caption("새 V2 전용 Supabase 계정으로 로그인하세요. 기존 대시보드 데이터는 가져오지 않습니다.")
+        with st.form("v2_login_form", clear_on_submit=False):
+            email = st.text_input("이메일", key="v2_login_email")
+            password = st.text_input("비밀번호", type="password", key="v2_login_password")
+            submitted = st.form_submit_button("로그인", type="primary", use_container_width=True)
+        if submitted:
+            try:
+                response = client.auth.sign_in_with_password({"email": email.strip(), "password": password})
+                session = getattr(response, "session", None)
+                user = _user_from_auth_response(response)
+                if session is None or user is None:
+                    raise RuntimeError("로그인 세션을 만들지 못했습니다.")
+                _save_auth_session(session)
+                st.session_state["_v2_supabase_user_email"] = getattr(user, "email", email.strip())
+                st.rerun()
+            except Exception as exc:
+                st.error(f"로그인에 실패했습니다. 이메일/비밀번호와 Supabase Auth 사용자를 확인하세요. ({type(exc).__name__})")
+        st.info("계정은 새 Supabase 프로젝트의 Authentication → Users에서 직접 생성합니다. 앱 안에는 공개 회원가입을 제공하지 않습니다.")
+        st.stop()
+
+    # The access token may have been refreshed by the SDK; keep the newest values in session state.
+    try:
+        current = client.auth.get_session()
+        _save_auth_session(current)
+    except Exception:
+        pass
+    st.session_state["_v2_supabase_user_email"] = getattr(user, "email", "") or st.session_state.get("_v2_supabase_user_email", "")
+    return client, user
+
+
+def _render_watchlist_page(client, user_id: str, rows: list[dict]) -> None:
+    st.subheader("관심종목 관리")
+    st.caption("V2 전용 신규 목록입니다. 기존 관심종목이나 거래 기록은 가져오지 않았습니다. 활성 종목만 Momentum Monitor/Pattern Scanner 분석 대상에 포함됩니다.")
+
+    with st.expander("➕ 관심종목 추가", expanded=not rows):
+        with st.form("v2_watchlist_add_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            ticker = c1.text_input("티커", placeholder="예: NVDA, GOOG, BRK-B")
+            sector = c2.text_input("섹터", placeholder="예: AI 반도체")
+            c3, c4 = st.columns(2)
+            classification_label = c3.selectbox("분류", ["일반 관찰", "Core", "Satellite"])
+            enabled = c4.checkbox("활성화 (분석 대상에 포함)", value=True)
+            note = st.text_area("메모 (선택)", max_chars=500, placeholder="관찰 이유, 관심 테마 등")
+            add_submitted = st.form_submit_button("관심종목 저장", type="primary", use_container_width=True)
+        if add_submitted:
+            classification = {"일반 관찰": "WATCH", "Core": "CORE", "Satellite": "SATELLITE"}[classification_label]
+            try:
+                add_watchlist_item(client, user_id, ticker=ticker, sector=sector, classification=classification, note=note, enabled=enabled)
+                st.success(f"{ticker.strip().upper()} 저장 완료")
+                st.rerun()
+            except WatchlistValidationError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                if "v2_watchlist_user_ticker_unique" in str(exc) or "duplicate key" in str(exc).lower():
+                    st.error("이미 등록된 티커입니다. 아래 목록에서 수정해 주세요.")
+                else:
+                    st.error(f"저장 실패: {type(exc).__name__}: {exc}")
+
+    if not rows:
+        st.info("관심종목이 없습니다. 위에서 첫 종목을 추가해 주세요.")
+        return
+
+    role_labels = {"WATCH": "일반 관찰", "CORE": "Core", "SATELLITE": "Satellite"}
+    display_rows = [{
+        "티커": r["ticker"], "섹터": r.get("sector") or "미분류",
+        "분류": role_labels.get(str(r.get("classification", "WATCH")), str(r.get("classification", "WATCH"))),
+        "활성": bool(r.get("enabled", True)), "메모": r.get("note") or "",
+    } for r in rows]
+    n_active = sum(bool(r.get("enabled", True)) for r in rows)
+    a, b, c = st.columns(3)
+    a.metric("전체 관심종목", len(rows))
+    b.metric("분석 활성", n_active)
+    c.metric("비활성", len(rows) - n_active)
+    st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("#### 종목 수정 또는 삭제")
+    tickers = [str(r["ticker"]) for r in rows]
+    selected_ticker = st.selectbox("수정할 티커", tickers, key="v2_watchlist_edit_ticker")
+    current = next(r for r in rows if str(r["ticker"]) == selected_ticker)
+    current_class = str(current.get("classification", "WATCH"))
+    class_to_label = {"WATCH": "일반 관찰", "CORE": "Core", "SATELLITE": "Satellite"}
+    label_to_class = {v: k for k, v in class_to_label.items()}
+    with st.form(f"v2_watchlist_edit_form_{selected_ticker}"):
+        e1, e2 = st.columns(2)
+        edit_sector = e1.text_input("섹터", value=str(current.get("sector") or ""), key=f"v2_sector_{selected_ticker}")
+        edit_class_label = e2.selectbox("분류", ["일반 관찰", "Core", "Satellite"], index=["일반 관찰", "Core", "Satellite"].index(class_to_label.get(current_class, "일반 관찰")), key=f"v2_class_{selected_ticker}")
+        edit_enabled = st.checkbox("활성화 (분석 대상에 포함)", value=bool(current.get("enabled", True)), key=f"v2_enabled_{selected_ticker}")
+        edit_note = st.text_area("메모", value=str(current.get("note") or ""), max_chars=500, key=f"v2_note_{selected_ticker}")
+        save_edit = st.form_submit_button("변경 저장", type="primary", use_container_width=True)
+    if save_edit:
+        try:
+            update_watchlist_item(client, user_id, selected_ticker, sector=edit_sector, classification=label_to_class[edit_class_label], note=edit_note, enabled=edit_enabled)
+            st.success(f"{selected_ticker} 변경 완료")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"수정 실패: {type(exc).__name__}: {exc}")
+
+    with st.expander("🗑️ 관심종목 삭제", expanded=False):
+        confirm_delete = st.checkbox(f"{selected_ticker} 삭제를 확인합니다", key=f"v2_confirm_delete_{selected_ticker}")
+        if st.button("선택 종목 삭제", disabled=not confirm_delete, key=f"v2_delete_{selected_ticker}"):
+            try:
+                delete_watchlist_item(client, user_id, selected_ticker)
+                st.success(f"{selected_ticker} 삭제 완료")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"삭제 실패: {type(exc).__name__}: {exc}")
+
+
+supabase_client, auth_user = _require_v2_login()
+user_id = str(auth_user.id)
+try:
+    watchlist_rows = list_watchlist(supabase_client, user_id)
+except Exception as exc:
+    st.title("Portfolio Dashboard V2")
+    st.error(f"V2 관심종목 테이블을 읽을 수 없습니다: {type(exc).__name__}: {exc}")
+    st.info("새 Supabase 프로젝트에서 sql/v2_watchlist_schema.sql을 실행했고, 로그인 사용자가 생성되어 있는지 확인하세요.")
+    st.stop()
+symbols = active_tickers(watchlist_rows)
+
 st.sidebar.title("Portfolio Dashboard V2")
-st.sidebar.caption("Cloud-ready · shared pattern/pivot/stage engine")
-page = st.sidebar.radio("화면", PAGES, index=3)
+st.sidebar.caption("V2 clean data · personal watchlist · shared EOD engine")
+page = st.sidebar.radio("화면", PAGES, index=0)
+st.sidebar.caption(f"관심종목 {len(watchlist_rows)}개 · 분석 활성 {len(symbols)}개")
+st.sidebar.caption(st.session_state.get("_v2_supabase_user_email", getattr(auth_user, "email", "")))
+if st.sidebar.button("로그아웃", key="v2_logout"):
+    try:
+        supabase_client.auth.sign_out()
+    except Exception:
+        pass
+    _clear_auth_session()
+    st.rerun()
 st.sidebar.divider()
 st.sidebar.markdown("**시장 데이터**")
 source = st.sidebar.selectbox(
@@ -190,8 +391,6 @@ source = st.sidebar.selectbox(
     index=0,
     help="미국 거래소의 가장 최근 완료 일봉만 사용합니다. 패턴/피봇은 auto_adjust=False OHLC, 다기간 수익률과 RS는 split·배당 조정 Adj Close 기준입니다. 완료 일봉이 없거나 데이터가 불완전하면 해당 종목을 표시하지 않습니다.",
 )
-symbol_text = st.sidebar.text_area("관심종목", value=DEFAULT_SYMBOLS, height=110, help="쉼표 또는 줄바꿈으로 구분")
-symbols = list(dict.fromkeys(x.strip().upper() for x in symbol_text.replace("\n", ",").split(",") if x.strip()))
 if source == "Yahoo Finance (EOD)":
     st.sidebar.info("EOD 정책 확정: auto_adjust=False OHLC로 패턴/피봇, Adj Close로 다기간 수익률·RS, RVOL은 당일 완료 거래량 ÷ 직전 20개 완료 일봉 평균. 미국 동부시간 16:15 전에는 당일 봉을 제외합니다.")
 elif source == "Bundled regression data (historical)":
@@ -200,7 +399,13 @@ elif source == "Bundled regression data (historical)":
 st.title("Portfolio Dashboard V2")
 st.caption("기준 명세: Functional Spec v0.12 · 기존 앱/DB와 분리 · 읽기 전용 분석")
 
-if page in {"Momentum Monitor", "Pattern Scanner"}:
+if page == "Watchlist":
+    try:
+        _render_watchlist_page(supabase_client, user_id, watchlist_rows)
+    except Exception as exc:
+        st.error(f"관심종목 화면 오류: {type(exc).__name__}: {exc}")
+
+elif page in {"Momentum Monitor", "Pattern Scanner"}:
     if source == "연결 안 함 (기본)":
         st.subheader(page)
         st.info("왼쪽에서 데이터 공급원을 선택하면 공통 재베이스·패턴·피봇 엔진이 종목을 분석합니다. 기본 상태에서는 임의의 시세나 신호를 표시하지 않습니다.")
@@ -208,7 +413,7 @@ if page in {"Momentum Monitor", "Pattern Scanner"}:
         st.write("완료 일봉 → 날짜순 재베이스 상태 → 단일 주 패턴/후보 피봇 → 역사적 Breakout Pivot → EOD Stage → 거리/RVOL/모멘텀")
         st.caption("Yahoo Finance EOD 정책: 완료된 미국 일봉만 사용합니다. 당일 가격 변동이 필요한 기능은 추후 별도 Live Monitor로 분리합니다.")
     elif not symbols:
-        st.warning("관심종목을 하나 이상 입력하세요.")
+        st.warning("활성 관심종목이 없습니다. 화면 왼쪽의 Watchlist에서 종목을 추가하거나 비활성화 여부를 확인하세요.")
     else:
         with st.spinner(f"{len(symbols)}개 종목의 일봉과 공통 엔진 결과를 계산 중…"):
             result, raw, errors, elapsed = _run_scan(symbols, source)
@@ -262,21 +467,21 @@ elif page == "App Monitor":
         ("Pattern Scanner 공통 엔진 연결", "구현"),
         ("Yahoo Finance 공급원", "EOD 데이터 정책 적용 · 외부 데이터 정정 가능"),
         ("7개 회귀 종목 과거 스냅샷", "포함·정답 라벨은 미검증"),
-        ("Supabase 실스키마/RLS 연결", "미연결·기존 DB 보호"),
+        ("V2 전용 Supabase Watchlist + RLS", "연결 필요: 신규 프로젝트/Secrets 설정"),
         ("나머지 화면 전체 기능 이관", "후속 구현"),
         ("주문 제출/자동 매매", "미구현·비활성"),
     ]
     st.dataframe(pd.DataFrame(status_rows, columns=["기능", "상태"]), use_container_width=True, hide_index=True)
-    st.info("이 단계는 두 핵심 화면을 실제 분석 엔진에 연결합니다. Supabase 읽기/쓰기, 포지션/매매일지, 나머지 화면은 아직 연결된 것으로 표시하지 않습니다.")
+    st.info("V2 전용 관심종목 CRUD만 신규 Supabase에 저장합니다. 기존 데이터는 가져오지 않으며, 보유종목·PP Journal 쓰기와 주문 제출은 아직 구현하지 않았습니다.")
 
 elif page == "Overview":
     st.subheader("Overview")
-    st.write("V2 핵심 분석 화면을 연결 중입니다. 실제 보유 포지션과 거래 기록은 아직 Supabase에 연결되지 않았습니다.")
+    st.write("V2는 새로 입력한 관심종목으로 시작합니다. 실제 보유 포지션과 거래 기록은 아직 별도 구현 대상입니다.")
     st.metric("핵심 화면 연결", "Momentum Monitor + Pattern Scanner")
-    st.caption("다음 단계는 레거시 DB 스키마를 확인한 후 읽기 전용으로 Holdings/Overview 데이터를 연결하는 것입니다.")
+    st.caption("핵심 우선순위는 Momentum Monitor → Live Monitor → PP Journal입니다. Overview/Holdings 등은 후순위입니다.")
 else:
     st.subheader(page)
     st.info("이 화면은 메뉴를 유지하고 있습니다. 기능 명세서에 따라 후속 단계에서 실제 데이터/기능을 연결합니다. 현재 화면은 아직 기능 이관이 완료되지 않았습니다.")
 
 st.divider()
-st.caption("운영 안전장치: 완료 일봉 전용 · DB 쓰기 없음 · 주문 제출 없음 · 기존 대시보드 변경 없음 · Yahoo 원천 데이터 정정 가능")
+st.caption("운영 안전장치: 새 V2 전용 DB만 사용 · RLS 사용자별 분리 · 완료 일봉 EOD 분석 · 주문 제출 없음 · 기존 DB 데이터 미사용 · Yahoo 원천 데이터 정정 가능")

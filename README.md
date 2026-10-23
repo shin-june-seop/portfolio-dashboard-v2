@@ -4,6 +4,9 @@ This is a clean-room rebuild, not a refactor of the legacy monolithic `app.py`. 
 
 ## Current state
 
+- V2-only authenticated watchlist CRUD (`public.v2_watchlist`) is the first persistent user-data feature. It uses a clean, separate Supabase project, email/password sign-in, row-level security, and no legacy-data import. See `WATCHLIST_SETUP.md`.
+- Enabled watchlist symbols are the shared source for Momentum Monitor and Pattern Scanner. The next planned stage is a separate intraday Live Monitor; PP Journal follows after that.
+
 Implemented and unit-tested:
 - Canonical OHLCV normalization and data validation.
 - Pivot distance, PIVOT APPROACH, EOD Stage transitions, Entry Quality normalization/extension gate.
@@ -21,16 +24,23 @@ Implemented and unit-tested:
 
 - Actual historical chart regressions for AMAT/MU/SOXX/META/GOOG/STX/LRCX. Dates and expected outcomes are intentionally not guessed.
 - Yahoo Finance is approved for V2 EOD analysis under the explicit policy in `DATA_SOURCE_POLICY.md`; upstream values may be revised and this is not an automatic-trading approval.
-- Actual Supabase table columns, primary/unique keys, foreign keys, types, views, RPCs, RLS, and triggers.
 - Broad historical pattern-label validation and a cloud browser smoke test for each deployed revision.
-- Actual Supabase read-only connection and full screen-by-screen migration.
+- Watchlist persistence requires the user to create a new empty Supabase project and configure Streamlit Cloud secrets.
+- Live Monitor and PP Journal persistence are not implemented yet; they are the next planned phases.
 
 Pattern thresholds are initial automation heuristics from Functional Spec v0.12, not universal chart-pattern truths. V2 is not a production trade-signal system yet.
 
+## Watchlist deployment
+
+1. Create a new empty Supabase project.
+2. Run `sql/v2_watchlist_schema.sql` in that project.
+3. Create your login user in Supabase Authentication → Users; disable public sign-ups if desired.
+4. Add `SUPABASE_URL` and `SUPABASE_ANON_KEY` to Streamlit Cloud app Secrets. Never use the `service_role` key.
+5. See `WATCHLIST_SETUP.md` for full steps.
+
 ## Safety boundaries
 
-- No Supabase writes or schema migrations.
-- Supabase access remains disabled by default; do not turn it on based solely on the static inventory.
+- V2 writes only user-owned rows to the new `v2_watchlist` table after login and RLS checks. It does not access or modify legacy tables.
 - No order submission, broker connection, automatic position closure, or invented account data.
 - Existing dashboard remains untouched until V2 acceptance checks pass.
 

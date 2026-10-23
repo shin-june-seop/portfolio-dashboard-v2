@@ -7,6 +7,10 @@ The functional specification is `Dashboard_V2_Functional_Spec_v0.12.md`. This pr
 ## 2. Data flow
 
 ```text
+Authenticated user (Supabase Auth)
+          ↓  RLS-scoped V2 watchlist CRUD only
+v2_watchlist (new, empty Supabase project; no legacy import)
+          ↓  enabled tickers
 Yahoo Finance EOD adapter (explicitly selected by user)
           ↓  completed daily bars + explicit as_of_date
 MarketDataService → normalize_ohlcv / data-quality validation
@@ -14,10 +18,6 @@ MarketDataService → normalize_ohlcv / data-quality validation
 Pure domain engines (pattern → rebase → pivot → stage; quality; risk/exit; PP)
           ↓
 Typed domain results (models/schemas.py)
-          ↓
-Snapshot/journal services (not yet connected)
-          ↓
-Read-only repositories (schema mapping pending inventory)
           ↓
 Streamlit pages (display only; no inline trading rules)
 ```
@@ -37,7 +37,8 @@ Streamlit pages (display only; no inline trading rules)
 - `engines/entry_quality_engine.py`: normalized component weighting and separate price-extension action gate. Initial Risk is intentionally absent.
 - `engines/risk_engine.py`: per-fill initial stop, monotonic trailing-stop updates, high-watermark reconstruction support, and EOD-only signal output. No order or position mutation.
 - `engines/pocket_pivot_engine.py`: strict prior-10-down-day volume comparison, MA support/reclaim, explicit wider context gate.
-- `repositories/supabase_repository.py`: optional read-only boundary. There are no insert/update/delete/upsert/RPC methods. It will not connect unless explicitly enabled.
+- `repositories/supabase_repository.py`: legacy-table read-only boundary, unused by the app.
+- `services/watchlist_repository.py`: the sole initial persistence feature; user-scoped CRUD against `public.v2_watchlist` only. It uses the public anon/publishable key, authenticated sessions, and RLS; it never reads or writes legacy tables.
 - `services/market_data_service.py`: canonical provider boundary; preserves a separate `Adj Close` series when supplied.
 - `services/yfinance_provider.py`: Yahoo EOD adapter using `auto_adjust=False` OHLC for technical analysis, separate `Adj Close` for total-return metrics, XNYS expected-session checking, and a 16:15 ET finalization cutoff.
 - `app.py`: presentation only. No trading state is calculated inside Streamlit pages.
@@ -45,15 +46,15 @@ Streamlit pages (display only; no inline trading rules)
 ## 4. Decisions intentionally not guessed yet
 
 1. Yahoo is approved for V2 EOD analysis under `DATA_SOURCE_POLICY.md`; historical pattern-label validation remains incremental. The source can revise data and must fail closed on missing/stale bars.
-2. Live Supabase tables, fields, unique constraints, views, RPC functions, RLS policies, triggers, and exact write paths; static source inventory is available but is not live-schema validation.
-3. Actual widget/action inventory for each retained legacy page.
+2. Additional V2 storage for trades/PP Journal and portfolio holdings; these are not part of this first watchlist stage.
+3. Actual widget/action inventory for each retained secondary page.
 4. Historical chart-pattern recognition/false-positive validation is ongoing; representative AMAT/MU/SOXX/META/GOOG/STX cases have been reviewed, but the full universe does not have independent chart-labelled ground truth.
-5. Core/Satellite storage scope and any schema migration.
+5. Intraday provider and Live Monitor behavior; it must remain separate from the completed EOD bars.
 
 ## 5. Failure and idempotency rules
 
 - Missing/invalid OHLCV is explicit; it cannot become a normal `BASE` by silent fallback.
-- Pure calculations are side-effect free.
+- Pure calculations are side-effect free. Watchlist CRUD is the only active DB write path and is isolated to `public.v2_watchlist` with `auth.uid() = user_id` RLS.
 - Official event persistence must use a deterministic key such as `(symbol, event_type, as_of_date, pivot)` or a stable event identifier so Streamlit reruns cannot duplicate events. The persistence service is not implemented yet.
 - Transactions, fills, partial exits, and historical breakout events are append-preserving records; re-computation must not overwrite them.
 - Stop signal creation never sends an order or closes a trade.
