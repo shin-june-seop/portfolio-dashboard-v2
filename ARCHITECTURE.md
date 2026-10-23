@@ -41,6 +41,9 @@ Streamlit pages (display only; no inline trading rules)
 - `services/watchlist_repository.py`: the sole initial persistence feature; user-scoped CRUD against `public.v2_watchlist` only. It uses the public anon/publishable key, authenticated sessions, and RLS; it never reads or writes legacy tables.
 - `services/market_data_service.py`: canonical provider boundary; preserves a separate `Adj Close` series when supplied.
 - `services/yfinance_provider.py`: Yahoo EOD adapter using `auto_adjust=False` OHLC for technical analysis, separate `Adj Close` for total-return metrics, XNYS expected-session checking, and a 16:15 ET finalization cutoff.
+
+- `services/quality_recovery_service.py`: compatibility port of the legacy V30 Quality Recovery Radar, including annual Yahoo income-statement growth gate, close-based 120/200MA event lifecycle, correction, and V30.5 RS versus QQQ. It has no database writes and does not touch official EOD stages, pivots, PP signals, or trades. The old SEC provider is unused by `app.py`.
+- `services/market_regime_service.py`: pure calculation layer for the legacy V25 broad-market Market Score/Regime. It stays separate from individual-stock Entry Stage, pattern/pivot, Pocket Pivot, and Live Monitor state. `app.py` caches the EOD market-data acquisition and only renders the result.
 - `app.py`: presentation only. No trading state is calculated inside Streamlit pages.
 
 ## 4. Decisions intentionally not guessed yet
@@ -75,3 +78,7 @@ Streamlit pages (display only; no inline trading rules)
 ## Live Monitor boundary
 
 `dashboard_v2/services/live_monitor_service.py` validates provisional Yahoo Finance 5-minute OHLCV, checks the XNYS session and timestamp freshness, and computes same-time cumulative intraday relative volume. It is isolated from the official daily-bar engine: Live Monitor reads official pattern/candidate pivot/breakout pivot/stage from `screening_service.analyze_symbol` using completed daily bars, then compares the latest intraday observation without writing official state or events. During regular hours a missing current-session bar or a bar older than 15 minutes disables live signal interpretation. Outside regular hours the page labels observations `MARKET CLOSED`. Intraday relative volume is explicitly not official EOD RVOL and cannot confirm a breakout.
+
+## Overview index cards (Phase 11)
+
+`dashboard_v2/services/overview_market_service.py` feeds only the Overview's three market cards. It independently validates completed daily OHLC for `^GSPC`, `^IXIC`, and `^DJI`, with the same XNYS 16:15 ET finalization boundary. Stale or invalid latest sessions fail closed. Since index-volume data is not consistently meaningful, SPY/QQQ/DIA 20-session-relative volume is an explicitly labelled visual proxy only. It never affects formal Market Score, single-stock RVOL, EOD stages, patterns, pivots, Live Monitor, or PP Journal. Market Score / Regime continues to be computed by `market_regime_service.py` and shown on Momentum Monitor; the separate sidebar page is removed.

@@ -5,7 +5,7 @@ This is a clean-room rebuild, not a refactor of the legacy monolithic `app.py`. 
 ## Current state
 
 - V2-only authenticated watchlist CRUD (`public.v2_watchlist`) is the first persistent user-data feature. It uses a clean, separate Supabase project, email/password sign-in, row-level security, and no legacy-data import. See `WATCHLIST_SETUP.md`.
-- Enabled watchlist symbols are the shared source for Momentum Monitor, Live Monitor, and Pattern Scanner. Live Monitor consumes provisional Yahoo Finance 5-minute bars separately from the official completed-daily-bar engine. PP Journal remains the next planned phase.
+- Enabled watchlist symbols are the shared source for Momentum Monitor, Live Monitor, and Pattern Scanner. Live Monitor consumes provisional Yahoo Finance 5-minute bars separately from the official completed-daily-bar engine. PP Journal records saved Pocket Pivot signals separately from actual trades. Quality Recovery ports the legacy V30 Quality Recovery Radar: annual Yahoo Finance income/revenue growth, 120/200MA event states, correction, and V30.5 RS vs QQQ.
 
 Implemented and unit-tested:
 - Canonical OHLCV normalization and data validation.
@@ -25,8 +25,8 @@ Implemented and unit-tested:
 - Actual historical chart regressions for AMAT/MU/SOXX/META/GOOG/STX/LRCX. Dates and expected outcomes are intentionally not guessed.
 - Yahoo Finance is approved for V2 EOD analysis under the explicit policy in `DATA_SOURCE_POLICY.md`; upstream values may be revised and this is not an automatic-trading approval.
 - Broad historical pattern-label validation and a cloud browser smoke test for each deployed revision.
-- Watchlist persistence requires the user to create a new empty Supabase project and configure Streamlit Cloud secrets.
-- Live Monitor is implemented as a read-only intraday view; it does not persist live state or official events. PP Journal persistence remains a future phase.
+- Watchlist and PP Journal persistence require the dedicated V2 Supabase project and corresponding SQL schemas. Quality Recovery uses Yahoo Finance and does not require SEC credentials or additional Secrets.
+- Live Monitor is implemented as a read-only intraday view; it does not persist live state or official events. Quality Recovery preserves the legacy annual statement rules. Its legacy `EPS Growth` label is based on annual Net Income growth, not true per-share EPS; missing statements stay CHECK.
 
 Pattern thresholds are initial automation heuristics from Functional Spec v0.12, not universal chart-pattern truths. V2 is not a production trade-signal system yet.
 
@@ -37,6 +37,7 @@ Pattern thresholds are initial automation heuristics from Functional Spec v0.12,
 3. Create your login user in Supabase Authentication → Users; disable public sign-ups if desired.
 4. Add `SUPABASE_URL` and `SUPABASE_ANON_KEY` to Streamlit Cloud app Secrets. Never use the `service_role` key.
 5. See `WATCHLIST_SETUP.md` for full steps.
+6. Quality Recovery does not need new SQL or SEC Secrets. It reads the active V2 Watchlist, completed Yahoo EOD bars, and Yahoo annual income statements.
 
 ## Safety boundaries
 
@@ -124,3 +125,7 @@ Deploy this repository with `app.py` as the entry point. Cloud installation uses
 ### Historical state note
 
 The historical fixture mode can use its matching bundled replay snapshot. Yahoo EOD bars use a separate split-normalized OHLC basis, so they intentionally do not resume the legacy auto-adjusted seed; they use a transparent rolling 300-bar replay. For those symbols, older breakout history beyond the window may not be reconstructed. All bundled states remain engine-generated starting states, not independently labelled ground truth.
+
+## Phase 11: Overview Index Panels
+
+Overview now displays compact S&P 500, Nasdaq Composite, and Dow candlestick cards using only the latest two completed daily index bars. Blue relative-volume bars are explicitly labelled ETF-proxy data (SPY/QQQ/DIA) rather than index volume and are not inputs to the Market Score or technical engines. The standalone Market Regime sidebar entry was removed; Market Score / Market Regime remains at the top of Momentum Monitor. No Supabase schema or Secrets changes are required.
