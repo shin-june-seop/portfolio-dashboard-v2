@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -36,6 +37,12 @@ from dashboard_v2.services.pp_journal_repository import (
 )
 from dashboard_v2.services.pp_journal_analytics import (
     analyze_pp_signal_outcome, summarize_trade, summarize_trades,
+)
+from dashboard_v2.services.market_regime_service import (
+    MARKET_SYMBOLS,
+    breadth_from_closes,
+    compute_market_regime,
+    market_metrics_from_bars,
 )
 from dashboard_v2.services.watchlist_repository import (
     active_tickers,
@@ -157,6 +164,191 @@ def _run_scan(symbols: list[str], source: str) -> tuple[pd.DataFrame, dict[str, 
             errors.append((symbol, f"Analysis {type(exc).__name__}: {exc}"))
     elapsed = time.perf_counter() - start
     return pd.DataFrame(rows), raw, errors, elapsed
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _load_market_regime_bars(symbol: str) -> pd.DataFrame:
+    """Load complete daily market bars for broad-market regime only."""
+    from dashboard_v2.services.yfinance_provider import YFinanceDailyProvider
+    return YFinanceDailyProvider(history_days=5 * 365).daily_bars(symbol)
+
+
+@st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
+def _load_market_constituent_tickers() -> tuple[str, ...]:
+    """Load S&P 500 + Nasdaq-100 members; ETF breadth is the safe fallback."""
+    from io import BytesIO
+    from urllib.request import Request, urlopen
+    sources = [
+        ("sp500", "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv"),
+        ("sp500", "https://yfiua.github.io/index-constituents/constituents-sp500.csv"),
+        ("nasdaq100", "https://yfiua.github.io/index-constituents/constituents-nasdaq100.csv"),
+    ]
+    chosen: dict[str, tuple[str, ...]] = {}
+    for kind, url in sources:
+        if kind in chosen:
+            continue
+        try:
+            req = Request(url, headers={"User-Agent": "PortfolioDashboardV2 market breadth"})
+            with urlopen(req, timeout=8) as response:
+                payload = response.read()
+            frame = pd.read_csv(BytesIO(payload))
+            columns = {str(c).strip().lower(): c for c in frame.columns}
+            ticker_col = next((columns[k] for k in ("symbol", "ticker", "ticker symbol", "ticker_symbol") if k in columns), None)
+            if ticker_col is None:
+                continue
+            values = (frame[ticker_col].astype(str).str.replace(".", "-", regex=False)
+                      .str.upper().str.strip())
+            values = values[values.str.match(r"^[A-Z][A-Z0-9-]{0,7}$", na=False)]
+            tickers = tuple(sorted(set(values.tolist())))
+            if (kind == "sp500" and len(tickers) >= 300) or (kind == "nasdaq100" and len(tickers) >= 70):
+                chosen[kind] = tickers
+        except Exception:
+            continue
+    # The broad-breadth series is only labelled S&P500 + Nasdaq-100 when both
+    # member lists loaded. If either is unavailable, use the legacy ETF proxy.
+    if not {"sp500", "nasdaq100"}.issubset(chosen):
+        return tuple()
+    return tuple(sorted(set().union(*[set(v) for v in chosen.values()])))
+
+
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def _load_broad_breadth_closes(anchor_date: str, tickers: tuple[str, ...]) -> pd.DataFrame:
+    """Download adjusted closes for index breadth in cached, resilient chunks."""
+    import yfinance as yf
+    if not tickers:
+        return pd.DataFrame()
+    anchor = pd.Timestamp(anchor_date).date()
+    start = (pd.Timestamp(anchor) - pd.Timedelta(days=820)).date().isoformat()
+    end = (pd.Timestamp(anchor) + pd.Timedelta(days=1)).date().isoformat()
+    frames = []
+    for start_i in range(0, len(tickers), 40):
+        chunk = list(tickers[start_i:start_i + 40])
+        try:
+            data = yf.download(chunk, start=start, end=end, interval="1d", auto_adjust=True,
+                               progress=False, threads=False, group_by="column")
+            if data is None or data.empty:
+                continue
+            if isinstance(data.columns, pd.MultiIndex):
+                level0 = [str(x) for x in data.columns.get_level_values(0)]
+                level1 = [str(x) for x in data.columns.get_level_values(1)]
+                if "Close" in level0:
+                    closes = data.xs("Close", axis=1, level=0).copy()
+                elif "Close" in level1:
+                    closes = data.xs("Close", axis=1, level=1).copy()
+                else:
+                    continue
+            elif "Close" in data.columns and len(chunk) == 1:
+                closes = data[["Close"]].copy()
+                closes.columns = [chunk[0]]
+            else:
+                continue
+            idx = pd.to_datetime(closes.index, errors="coerce")
+            if getattr(idx, "tz", None) is not None:
+                idx = idx.tz_convert("America/New_York").tz_localize(None)
+            closes.index = pd.DatetimeIndex(idx).normalize()
+            closes = closes.loc[~closes.index.isna()]
+            closes = closes.loc[closes.index.date <= anchor]
+            closes.columns = [str(c).upper().strip() for c in closes.columns]
+            closes = closes.loc[:, ~closes.columns.duplicated()].copy()
+            if not closes.empty:
+                frames.append(closes)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, axis=1)
+    out = out.loc[:, ~out.columns.duplicated()].sort_index()
+    out = out.loc[:, ~out.columns.duplicated()].copy()
+    # A stale broad-universe frame must not silently pass as today's market breadth.
+    if out.empty or pd.Timestamp(out.index[-1]).date() != anchor:
+        return pd.DataFrame()
+    return out
+
+
+def _compute_market_regime() -> dict[str, Any]:
+    """Compute the legacy V25 score using only completed US-session bars."""
+    market_bars: dict[str, pd.DataFrame] = {}
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_load_market_regime_bars, symbol): symbol for symbol in MARKET_SYMBOLS}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                market_bars[symbol] = future.result()
+            except Exception as exc:
+                errors.append(f"{symbol}: {type(exc).__name__}")
+    metrics = {symbol: market_metrics_from_bars(bars) for symbol, bars in market_bars.items()}
+    metrics = {symbol: metric for symbol, metric in metrics.items() if metric is not None}
+    # Keep the same fallback as the legacy dashboard: broad S&P500 + Nasdaq-100
+    # breadth when complete, otherwise the 13-ETF market participation proxy.
+    qqq = metrics.get("QQQ")
+    spy = metrics.get("SPY")
+    broad = None
+    if qqq and spy and qqq.get("data_date") == spy.get("data_date"):
+        constituents = _load_market_constituent_tickers()
+        if constituents:
+            closes = _load_broad_breadth_closes(str(qqq["data_date"]), constituents)
+            broad = breadth_from_closes(closes, expected_date=str(qqq["data_date"]))
+    result = compute_market_regime(metrics, broad_breadth=broad)
+    result["market_data_errors"] = errors
+    return result
+
+
+def _render_momentum_market_header() -> None:
+    """Render the legacy-style Market Score / Market Regime summary only."""
+    st.markdown("## 🔭 Momentum Monitor")
+    with st.spinner("완료된 미국 시장 데이터로 Market Score와 Regime을 계산하는 중…"):
+        regime = _compute_market_regime()
+    if not regime.get("available"):
+        st.warning(str(regime.get("action") or "시장 레짐 데이터를 사용할 수 없습니다."))
+        with st.expander("시장 데이터 진단"):
+            st.write(str(regime.get("reason") or "MARKET_DATA_UNAVAILABLE"))
+            errs = regime.get("market_data_errors") or []
+            if errs:
+                st.write(" · ".join(errs))
+        return
+
+    score = int(regime["score"])
+    c_score, c_regime, c_action = st.columns([1.0, 1.9, 3.1])
+    c_score.metric("Market Score", f"{score}/100")
+    label = str(regime.get("label") or "⚪ 시장 데이터 부족")
+    c_regime.markdown(
+        f"<div style='padding-top:2px;'><div style='font-size:14px;color:#8b9bb4;margin-bottom:4px;'>Market Regime</div>"
+        f"<div style='font-size:27px;line-height:1.15;font-weight:600;white-space:nowrap;'>{label}</div></div>",
+        unsafe_allow_html=True,
+    )
+    action = str(regime.get("action") or "")
+    if score < 65:
+        c_action.warning("⚠️ " + action)
+    else:
+        c_action.info("🌐 " + action)
+    st.progress(score / 100.0)
+    st.caption(
+        f"기준일: {regime.get('data_date', '—')} · 완료된 미국 정규장 일봉 기준 · "
+        f"시장 참여도: {regime.get('breadth_source', '데이터 부족')} · "
+        "Market Regime은 개별 종목의 공식 Entry Stage를 변경하지 않습니다."
+    )
+    with st.expander("Market Score 구성 근거"):
+        components = regime.get("components") or {}
+        maxima = {"QQQ 장기추세": 20, "S&P500 장기추세": 15, "50/200MA 구조": 15,
+                  "시장 참여도": 20, "분산매도": 15, "성장 리더십": 15}
+        cols = st.columns(6)
+        for col, (name, value) in zip(cols, components.items()):
+            col.metric(name, f"{value}/{maxima.get(name, 20)}")
+        q = regime.get("metrics", {}).get("QQQ", {})
+        spy = regime.get("metrics", {}).get("SPY", {})
+        a, b, c, d = st.columns(4)
+        a.metric("QQQ vs 200MA", f"{q.get('price_vs_200_pct', np.nan):+.2f}%" if q else "—")
+        b.metric("S&P500 vs 200MA", f"{spy.get('price_vs_200_pct', np.nan):+.2f}%" if spy else "—")
+        b50, b200 = regime.get("breadth_above50_pct"), regime.get("breadth_above200_pct")
+        c.metric("50MA 위 시장", f"{b50:.0f}%" if pd.notna(b50) else "—")
+        d.metric("200MA 위 시장", f"{b200:.0f}%" if pd.notna(b200) else "—")
+        e, f, g = st.columns(3)
+        e.metric("QQQ 분산매도(25일)", int(regime.get("distribution_qqq", 0)))
+        f.metric("SPY 분산매도(25일)", int(regime.get("distribution_spy", 0)))
+        leader = regime.get("leader_above50_pct")
+        leader_rel = regime.get("leader_relative_3m_pct")
+        g.metric("성장 리더십", f"{leader:.0f}% · RS {leader_rel:+.1f}%p" if pd.notna(leader) and pd.notna(leader_rel) else "데이터 부족")
 
 
 def _fmt_num(value, digits: int = 2):
@@ -1258,8 +1450,11 @@ elif page == "PP Journal":
     _render_pp_journal_page(supabase_client, user_id, symbols)
 
 elif page in {"Momentum Monitor", "Pattern Scanner"}:
+    if page == "Momentum Monitor":
+        _render_momentum_market_header()
     if source == "연결 안 함 (기본)":
-        st.subheader(page)
+        if page != "Momentum Monitor":
+            st.subheader(page)
         st.info("왼쪽에서 데이터 공급원을 선택하면 공통 재베이스·패턴·피봇 엔진이 종목을 분석합니다. 기본 상태에서는 임의의 시세나 신호를 표시하지 않습니다.")
         st.markdown("**이 화면에서 사용하는 공통 엔진**")
         st.write("완료 일봉 → 날짜순 재베이스 상태 → 단일 주 패턴/후보 피봇 → 역사적 Breakout Pivot → EOD Stage → 거리/RVOL/모멘텀")
@@ -1286,7 +1481,6 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
                 st.caption("엔진 출력은 관측 결과이며, 별도 라벨링된 정답 차트와 대조되지 않은 항목은 검증 완료로 간주하지 않습니다.")
 
             if page == "Momentum Monitor":
-                st.subheader("Momentum Monitor")
                 st.caption("패턴·Candidate Pivot·Breakout Pivot·20D Reference·Stage는 동일한 날짜순 엔진 결과에서 가져옵니다.")
                 _render_scan_table(result)
             else:
