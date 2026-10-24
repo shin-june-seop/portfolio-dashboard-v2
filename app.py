@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components_html
 
 from dashboard_v2.services.screening_service import analyze_symbol, load_seed_snapshots
 from dashboard_v2.services.quality_recovery_service import (
@@ -55,6 +56,11 @@ from dashboard_v2.services.momentum_market_map_service import (
     build_market_map_figure,
     fetch_market_map_data,
     market_map_status_caption,
+)
+from dashboard_v2.services.momentum_monitor_service import (
+    FALLBACK_MOMENTUM_UNIVERSE, LEGACY_SECTOR_OPTIONS,
+    build_momentum_monitor_frame, sector_leadership_reason,
+    sector_leadership_table_html, trend_template_strip_html,
 )
 from dashboard_v2.services.watchlist_repository import (
     active_tickers,
@@ -471,6 +477,129 @@ def _render_momentum_market_header() -> None:
 
 def _fmt_num(value, digits: int = 2):
     return "—" if value is None or pd.isna(value) else f"{float(value):,.{digits}f}"
+
+
+def _render_momentum_monitor_full(
+    scan_result: pd.DataFrame,
+    raw_by_ticker: Mapping[str, pd.DataFrame],
+    watchlist_rows: list[dict[str, Any]],
+) -> None:
+    """Legacy V50.53-style sector leadership and per-sector Momentum tables.
+
+    All official EOD fields come from the V2 chronological scan. This layer adds
+    legacy-compatible cross-sectional Momentum, RS, and explanatory columns only.
+    """
+    if scan_result is None or scan_result.empty:
+        st.info("Momentum Monitor 결과가 없습니다.")
+        return
+
+    try:
+        anchor = pd.to_datetime(scan_result["as_of_date"], errors="coerce").dropna().max()
+        if pd.isna(anchor):
+            raise ValueError("NO_EOD_ANCHOR_DATE")
+        anchor_date = anchor.date().isoformat()
+    except Exception:
+        st.warning("완료 일봉 기준일을 확인할 수 없어 Momentum/RS/섹터 점수를 계산하지 않습니다.")
+        _render_scan_table(scan_result)
+        return
+
+    benchmark_tickers = tuple(_load_market_constituent_tickers() or ())
+    universe_label = "S&P 500 + Nasdaq-100 구성 종목"
+    if not benchmark_tickers:
+        benchmark_tickers = FALLBACK_MOMENTUM_UNIVERSE
+        universe_label = "기존 ETF 대체 바스켓 (구성 종목 데이터 부족)"
+
+    benchmark_closes = _load_broad_breadth_closes(anchor_date, tuple(benchmark_tickers))
+    # The legacy formula requires a full year of aligned completed adjusted-close
+    # data. Retry with the explicit ETF fallback if constituent history is partial.
+    if (benchmark_closes is None or benchmark_closes.empty or len(benchmark_closes) < 253) and benchmark_tickers != FALLBACK_MOMENTUM_UNIVERSE:
+        benchmark_tickers = FALLBACK_MOMENTUM_UNIVERSE
+        universe_label = "기존 ETF 대체 바스켓 (구성 종목 데이터 부족)"
+        benchmark_closes = _load_broad_breadth_closes(anchor_date, tuple(benchmark_tickers))
+
+    qqq_history = None
+    try:
+        qqq_history = _load_yfinance_bars("QQQ")
+    except Exception:
+        qqq_history = None
+
+    with st.spinner("기존 방식의 Momentum·RS·Sector Leadership을 계산하는 중…"):
+        monitor, leadership = build_momentum_monitor_frame(
+            scan_result, raw_by_ticker, watchlist_rows,
+            benchmark_closes, benchmark_tickers, qqq_history,
+        )
+
+    if monitor.empty:
+        st.warning("모니터 표시값을 구성하지 못했습니다. 공식 EOD 결과는 아래 표에서 확인할 수 있습니다.")
+        _render_scan_table(scan_result)
+        return
+
+    st.markdown("### 🏆 Sector Leadership — 섹터 리더십")
+    st.caption(
+        "활성 관심종목을 섹터 단위로 묶어 RS·Momentum·최근 변화·Breakout Readiness·강한 종목 비율을 종합합니다. "
+        "한 종목의 급등보다 섹터 전체 참여를 중요하게 봅니다. Readiness의 대체 20일 기준 고점은 참고용이며 공식 Candidate Pivot이 아닙니다."
+    )
+    if benchmark_closes is None or benchmark_closes.empty or len(benchmark_closes) < 253 or pd.Timestamp(benchmark_closes.index[-1]).date().isoformat() != anchor_date:
+        st.warning("Momentum 순위용 adjusted-close 벤치마크가 기준일과 일치하지 않거나 253개 완료 일봉이 부족합니다. 해당 Momentum 점수는 비워 둡니다.")
+    else:
+        st.caption(f"Momentum 기준: {universe_label} · 조정종가 기준 1/3/6/12개월 수익률 백분위 40/30/20/10 · 기준일 {anchor_date}")
+    st.caption("RS는 QQQ 대비 21/63/126/252 거래일(15/35/25/25 가중치), 변화는 20거래일 전 RS 대비입니다.")
+
+    if leadership is None or leadership.empty:
+        st.info("섹터 리더십을 계산할 수 있는 유효한 RS / Momentum / Readiness 자료가 없습니다.")
+    else:
+        sector_html = sector_leadership_table_html(leadership)
+        components_html_height = max(120, 55 + 37 * len(leadership))
+        components_html_height = min(850, components_html_height)
+        components_html.html(sector_html, height=components_html_height, scrolling=False)
+        top = leadership.iloc[0].to_dict()
+        st.caption("🥇 섹터 리더: " + str(top.get("섹터", "—")) + " · " + sector_leadership_reason(top))
+
+    st.markdown("### 📋 오늘의 Momentum 상태")
+    st.caption("RS Engine V30.5 호환 · Momentum은 횡단면 백분위 · 초기 위험도와 Turtle 2N은 참고 지표이며 Entry Quality 계산에 포함하지 않습니다.")
+    st.caption("공식 Pattern / Candidate Pivot / Breakout Pivot / Rebase / EOD Stage / RVOL은 V2 chronological engine 값입니다. Breakout Readiness와 Base는 참고용이며 공식 Stage나 Pivot을 생성·수정하지 않습니다.")
+    st.caption("RVOL은 V2 규칙에 따라 현재 완료 일봉 거래량 ÷ 직전 20개 완료 일봉 평균으로 표시합니다. 기존 화면의 RVOL (50D) 표기로 바꾸지 않습니다.")
+
+    preferred_columns = [
+        "종목", "현재가", "Entry Stage", "Entry Quality", "Initial Risk", "Turtle 2N Risk", "Action",
+        "Momentum", "Momentum 변화", "RS", "RS 변화", "Base", "Pattern", "Pattern 상단",
+        "Candidate Pivot", "Candidate Pivot Source", "VCP Volume", "PP Guide 10D", "PP Guide 50D",
+        "PP Confluence", "PP Status", "Trend Template", "돌파 Pivot", "Pivot Source", "Next Pivot",
+        "돌파 Pivot 거리", "RVOL (20D)", "Breakout Readiness", "돌파 준비도", "MA", "RSI", "MACD", "VFI",
+        "BB Width", "Tech", "변화",
+    ]
+    present_columns = [c for c in preferred_columns if c in monitor.columns]
+    ordered_sectors = [s for s in LEGACY_SECTOR_OPTIONS if s in set(monitor["섹터"].astype(str))]
+    custom_sectors = sorted(set(monitor["섹터"].astype(str)) - set(LEGACY_SECTOR_OPTIONS))
+    ordered_sectors.extend(custom_sectors)
+    for sector in ordered_sectors:
+        part = monitor[monitor["섹터"].astype(str) == sector].copy().sort_values("종목", kind="stable")
+        if part.empty:
+            continue
+        st.markdown(f"#### {sector} · {len(part)}개")
+        st.markdown(trend_template_strip_html(part), unsafe_allow_html=True)
+        st.dataframe(
+            part[present_columns], use_container_width=True, hide_index=True,
+            height=min(580, max(100, 38 + 35 * len(part))),
+            key="v2_momentum_sector_" + "_".join(ch for ch in sector.lower().replace("/", " ").split() if ch.isalnum()),
+        )
+
+    options = monitor["종목"].astype(str).tolist()
+    if options:
+        with st.expander("🔎 선택 종목 상세 및 판정 근거", expanded=False):
+            selected = st.selectbox("종목", options, key="v2_momentum_selected_ticker")
+            row = monitor.loc[monitor["종목"].astype(str) == selected].iloc[0]
+            a, b, c, d = st.columns(4)
+            a.metric("현재가", row.get("현재가", "—"))
+            b.metric("Entry Stage", row.get("Entry Stage", "—"))
+            c.metric("Entry Quality", row.get("Entry Quality", "—"))
+            d.metric("Momentum / RS", f"{row['Momentum']:.1f} / {row['RS']:.0f}" if pd.notna(row.get("Momentum")) and pd.notna(row.get("RS")) else "—")
+            st.write("**공식 패턴:** " + str(row.get("Pattern", "—")))
+            st.write("**Candidate Pivot / Source:** " + str(row.get("Candidate Pivot", "—")) + " · " + str(row.get("Candidate Pivot Source", "—")))
+            st.write("**Breakout Pivot / Source:** " + str(row.get("돌파 Pivot", "—")) + " · " + str(row.get("Pivot Source", "—")))
+            st.write("**Entry Quality 구성:** " + str(row.get("Entry Quality Detail", "—")))
+            st.write("**Trend Template 미달:** " + str(row.get("Trend Template 미달", "—")))
+            st.write("**Readiness 참고 기준:** " + str(row.get("_readiness_reference", "—")) + " · 거리 " + (f"{float(row['_readiness_distance']):+.2f}%" if pd.notna(row.get("_readiness_distance")) else "—"))
 
 
 def _render_scan_table(frame: pd.DataFrame, *, pattern_mode: bool = False):
@@ -1604,7 +1733,11 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
 
             if page == "Momentum Monitor":
                 st.caption("패턴·Candidate Pivot·Breakout Pivot·20D Reference·Stage는 동일한 날짜순 엔진 결과에서 가져옵니다.")
-                _render_scan_table(result)
+                if source == "Yahoo Finance (EOD)":
+                    _render_momentum_monitor_full(result, raw, watchlist_rows)
+                else:
+                    st.info("기존 스타일의 횡단면 Momentum·RS·섹터 리더십은 완료된 Yahoo Finance EOD 데이터에서 표시합니다. 과거 번들 분석에서는 공식 EOD 표만 표시합니다.")
+                    _render_scan_table(result)
                 _render_momentum_market_map(
                     symbols, watchlist_rows,
                     result if source == "Yahoo Finance (EOD)" else None,
