@@ -57,6 +57,9 @@ from dashboard_v2.services.momentum_market_map_service import (
     fetch_market_map_data,
     market_map_status_caption,
 )
+from dashboard_v2.services.technical_confirmation_service import (
+    calculate_technical_confirmation, korean_ma_status, korean_technical_status, korean_trend_status,
+)
 from dashboard_v2.services.momentum_monitor_service import (
     FALLBACK_MOMENTUM_UNIVERSE, LEGACY_SECTOR_OPTIONS,
     build_momentum_monitor_frame, sector_leadership_reason,
@@ -600,6 +603,75 @@ def _render_momentum_monitor_full(
             st.write("**Entry Quality 구성:** " + str(row.get("Entry Quality Detail", "—")))
             st.write("**Trend Template 미달:** " + str(row.get("Trend Template 미달", "—")))
             st.write("**Readiness 참고 기준:** " + str(row.get("_readiness_reference", "—")) + " · 거리 " + (f"{float(row['_readiness_distance']):+.2f}%" if pd.notna(row.get("_readiness_distance")) else "—"))
+
+
+
+def _render_technical_confirmation_detail(
+    raw_by_ticker: Mapping[str, pd.DataFrame],
+    tickers: list[str],
+    *,
+    as_of_date: Any = None,
+) -> None:
+    """Render the legacy V50.53 Technical Confirmation detail below Momentum Monitor.
+
+    This uses only the same completed daily OHLCV frame already consumed by the
+    official V2 EOD scan. It is a descriptive confirmation layer and cannot
+    modify official pattern, pivot, rebase, RVOL, or Entry Stage outputs.
+    """
+    st.markdown("---")
+    st.markdown("## 🧭 Technical Confirmation 상세")
+    st.caption(
+        "기존 대시보드 V22/V24 계산 방식 · 완료된 EOD 일봉 기준 · "
+        "기술적 확인 전용이며 공식 Pattern / Pivot / Entry Stage를 변경하지 않습니다."
+    )
+    options = sorted({str(t).strip().upper() for t in (tickers or []) if str(t).strip()})
+    if not options:
+        st.info("기술적 확인을 표시할 활성 관심종목이 없습니다.")
+        return
+
+    selected_tech = st.selectbox("기술적 확인 종목", options, key="v2_technical_confirmation_ticker")
+    bars = (raw_by_ticker or {}).get(selected_tech)
+    tr = calculate_technical_confirmation(bars, as_of_date=as_of_date)
+    if tr.get("data_status") != "OK":
+        st.warning(
+            f"{selected_tech}: 기술 지표를 계산할 완료 일봉이 부족합니다. "
+            "유효한 일봉이 최소 60개 필요하며 데이터가 부족하면 임의 값을 표시하지 않습니다."
+        )
+        return
+
+    first = st.columns(5)
+    first[0].metric("현재가", f"${tr['price']:,.2f}" if pd.notna(tr.get("price")) else "—")
+    first[1].metric("20일선", f"${tr['ma20']:,.2f}" if pd.notna(tr.get("ma20")) else "—")
+    first[2].metric("50일선", f"${tr['ma50']:,.2f}" if pd.notna(tr.get("ma50")) else "—")
+    first[3].metric("주가 vs 20MA", f"{tr['price_vs_ma20_pct']:+.2f}%" if pd.notna(tr.get("price_vs_ma20_pct")) else "—")
+    first[4].metric("주가 vs 50MA", f"{tr['price_vs_ma50_pct']:+.2f}%" if pd.notna(tr.get("price_vs_ma50_pct")) else "—")
+
+    second = st.columns(4)
+    second[0].metric("20MA vs 50MA", f"{tr['ma20_vs_ma50_pct']:+.2f}%" if pd.notna(tr.get("ma20_vs_ma50_pct")) else "—")
+    second[1].metric("MA Spread 변화", f"{tr['ma_spread_delta_pct']:+.2f}%p" if pd.notna(tr.get("ma_spread_delta_pct")) else "—")
+    second[2].metric("RSI(14)", f"{tr['rsi']:.1f}" if pd.notna(tr.get("rsi")) else "—")
+    second[3].metric("기술 확인 점수", korean_technical_status(tr.get("technical_status", "⚪ N/A")))
+
+    if all(pd.notna(tr.get(key)) for key in ("macd_hist", "vfi", "bb_width")):
+        st.caption(
+            f"MA 상태: {korean_ma_status(tr.get('ma_status', '⚪ N/A'))} · "
+            f"MACD Hist {tr['macd_hist']:+.2f} · VFI {tr['vfi']:+.1f} · "
+            f"BB Width {tr['bb_width']:.2f}% · 기준일 {tr.get('as_of_date', '—')}"
+        )
+    else:
+        st.caption("기술 지표 데이터가 아직 충분하지 않습니다. 표시 가능한 지표만 해석하세요.")
+
+    st.markdown("**방향성 판단**")
+    direction_cols = st.columns(5)
+    direction_cols[0].metric("MA", korean_ma_status(tr.get("ma_status", "⚪ N/A")))
+    direction_cols[1].metric("RSI", korean_trend_status(tr.get("rsi_trend", "⚪ N/A")))
+    direction_cols[2].metric("MACD", korean_trend_status(tr.get("macd_hist_trend", "⚪ N/A")))
+    direction_cols[3].metric("VFI", korean_trend_status(tr.get("vfi_trend", "⚪ N/A")))
+    direction_cols[4].metric("BB", korean_trend_status(tr.get("bb_trend", "⚪ N/A")))
+    reasons = tr.get("technical_reasons") or []
+    if reasons:
+        st.caption("판정 근거: " + " · ".join(str(reason) for reason in reasons))
+    st.caption("VFI는 기존 대시보드의 VFI-style 거래량·가격 흐름 근사치이며, 별도의 공식 매수 신호가 아닙니다.")
 
 
 def _render_scan_table(frame: pd.DataFrame, *, pattern_mode: bool = False):
@@ -1742,6 +1814,8 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
                     symbols, watchlist_rows,
                     result if source == "Yahoo Finance (EOD)" else None,
                 )
+                if source == "Yahoo Finance (EOD)":
+                    _render_technical_confirmation_detail(raw, symbols, as_of_date=latest_date)
             else:
                 st.subheader("Pattern Scanner")
                 st.caption("종목별 주 패턴과 활성 후보 피봇을 스캔합니다. 진단용 보조 탐지는 활성 피봇을 덮어쓰지 않습니다.")
