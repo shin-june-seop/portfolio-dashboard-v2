@@ -51,6 +51,11 @@ from dashboard_v2.services.overview_intraday_service import (
     fetch_intraday_index_bars,
     render_intraday_index_header_html,
 )
+from dashboard_v2.services.momentum_market_map_service import (
+    build_market_map_figure,
+    fetch_market_map_data,
+    market_map_status_caption,
+)
 from dashboard_v2.services.watchlist_repository import (
     active_tickers,
     add_watchlist_item,
@@ -224,6 +229,66 @@ def _render_overview_intraday_cards() -> None:
         "카드는 5분마다 갱신됩니다. 상대거래량은 각 지수에 공급된 장중 거래량을 과거 동일 시간대와 비교한 보조 지표이며, "
         "데이터가 없으면 임의의 RVOL을 표시하지 않습니다. 이 화면은 읽기 전용이며 공식 EOD 패턴·피봇·Stage를 변경하지 않습니다."
     )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_momentum_market_map_quotes(
+    tickers: tuple[str, ...], sectors: tuple[tuple[str, str], ...]
+) -> pd.DataFrame:
+    """Cached 5-minute/EOD quote layer; independent of the official EOD scan."""
+    return fetch_market_map_data(tickers, sector_by_ticker=dict(sectors))
+
+
+def _render_momentum_market_map(
+    symbols: list[str],
+    watchlist_rows: list[dict[str, Any]],
+    scan_result: pd.DataFrame | None = None,
+) -> None:
+    """Render the legacy V50.53 watchlist Market Map without touching EOD state."""
+    st.markdown("### 📊 관심종목 Market Map")
+    st.caption("5분 자동 갱신 · 장중 = 현재가/전일 종가 · 장외 = 확정 종가/전일 종가 · 색 = 1D 수익률")
+    if not symbols:
+        st.info("활성 관심종목이 없습니다. Watchlist에서 종목을 추가하거나 활성화해 주세요.")
+        return
+
+    sector_by_ticker = {
+        str(row.get("ticker", "")).upper().strip(): str(row.get("sector") or "미분류")
+        for row in (watchlist_rows or []) if str(row.get("ticker", "")).strip()
+    }
+    sectors = tuple(sorted(sector_by_ticker.items()))
+    stage_by_ticker: dict[str, str] = {}
+    # Historical regression data must not be mixed with a current live market map.
+    if isinstance(scan_result, pd.DataFrame) and not scan_result.empty and {"ticker", "stage"}.issubset(scan_result.columns):
+        stage_by_ticker = {
+            str(row["ticker"]).upper().strip(): (
+                str(row["stage"]) if pd.notna(row["stage"]) and str(row["stage"]).strip() else "-"
+            )
+            for row in scan_result[["ticker", "stage"]].to_dict("records")
+        }
+
+    @st.fragment(run_every="5m")
+    def _market_map_fragment() -> None:
+        with st.spinner("관심종목 Market Map 업데이트 중…"):
+            quotes = _load_momentum_market_map_quotes(tuple(sorted(set(symbols))), sectors)
+        if quotes is None or quotes.empty:
+            st.warning("Market Map 가격 데이터를 계산하지 못했습니다. 잠시 후 다시 갱신하세요.")
+            return
+        figure = build_market_map_figure(
+            quotes, stage_by_ticker=stage_by_ticker, sector_by_ticker=sector_by_ticker
+        )
+        st.plotly_chart(
+            figure, use_container_width=True,
+            config={"displayModeBar": False, "responsive": True},
+            key="v2_momentum_market_map_chart",
+        )
+        st.caption(market_map_status_caption(quotes))
+        unavailable = sorted(set(symbols) - set(quotes["ticker"].astype(str).str.upper()))
+        if unavailable:
+            st.caption("현재 시세를 확보하지 못해 맵에서 제외된 종목: " + ", ".join(unavailable))
+        if not stage_by_ticker:
+            st.caption("Entry Stage는 현재 EOD 스캔 결과가 있을 때 표시합니다. 과거 번들 데이터의 Stage는 현재 시세 지도에 섞지 않습니다.")
+
+    _market_map_fragment()
 
 
 @st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
@@ -1512,6 +1577,8 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
         st.markdown("**이 화면에서 사용하는 공통 엔진**")
         st.write("완료 일봉 → 날짜순 재베이스 상태 → 단일 주 패턴/후보 피봇 → 역사적 Breakout Pivot → EOD Stage → 거리/RVOL/모멘텀")
         st.caption("Yahoo Finance EOD 정책: 완료된 미국 일봉만 사용합니다. 장중 가격/누적 거래량은 별도 Live Monitor에서 분리해 확인합니다.")
+        if page == "Momentum Monitor":
+            _render_momentum_market_map(symbols, watchlist_rows)
     elif not symbols:
         st.warning("활성 관심종목이 없습니다. 화면 왼쪽의 Watchlist에서 종목을 추가하거나 비활성화 여부를 확인하세요.")
     else:
@@ -1519,6 +1586,8 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
             result, raw, errors, elapsed = _run_scan(symbols, source)
         if result.empty:
             st.error("분석할 수 있는 종목이 없습니다. 데이터 공급원과 심볼을 확인하세요.")
+            if page == "Momentum Monitor":
+                _render_momentum_market_map(symbols, watchlist_rows)
         else:
             latest_date = result["as_of_date"].max()
             k1, k2, k3, k4 = st.columns(4)
@@ -1536,6 +1605,10 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
             if page == "Momentum Monitor":
                 st.caption("패턴·Candidate Pivot·Breakout Pivot·20D Reference·Stage는 동일한 날짜순 엔진 결과에서 가져옵니다.")
                 _render_scan_table(result)
+                _render_momentum_market_map(
+                    symbols, watchlist_rows,
+                    result if source == "Yahoo Finance (EOD)" else None,
+                )
             else:
                 st.subheader("Pattern Scanner")
                 st.caption("종목별 주 패턴과 활성 후보 피봇을 스캔합니다. 진단용 보조 탐지는 활성 피봇을 덮어쓰지 않습니다.")
