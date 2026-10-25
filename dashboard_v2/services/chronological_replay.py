@@ -45,6 +45,7 @@ def replay_symbol(
 
     candidate_pivot = initial_candidate_pivot
     breakout_pivot = initial_breakout_pivot
+    breakout_pivot_source = "INITIAL_STATE" if initial_breakout_pivot is not None else None
     breakout_date = pd.Timestamp(initial_breakout_date).date() if initial_breakout_date else None
     breakout_active = bool(initial_breakout_active and breakout_pivot is not None)
     rebase_state = RebaseState(active=False)
@@ -60,6 +61,7 @@ def replay_symbol(
     if resume_snapshot is not None:
         candidate_pivot = _optional_float(resume_snapshot.get("candidate_pivot"))
         breakout_pivot = _optional_float(resume_snapshot.get("breakout_pivot"))
+        breakout_pivot_source = (str(resume_snapshot.get("breakout_pivot_source") or "HISTORICAL_SOURCE_NOT_STORED") if breakout_pivot is not None else None)
         breakout_date = pd.Timestamp(resume_snapshot["breakout_date"]).date() if resume_snapshot.get("breakout_date") and pd.notna(resume_snapshot.get("breakout_date")) else None
         breakout_active = bool(resume_snapshot.get("breakout_cycle_active", False)) and breakout_pivot is not None
         previous_close = _optional_float(resume_snapshot.get("close"))
@@ -215,6 +217,7 @@ def replay_symbol(
                 # The Breakout Pivot changes only on an actual upward cross of a
                 # valid candidate pivot. Until then, keep the last historical value.
                 breakout_pivot = float(stage.activate_breakout_pivot)
+                breakout_pivot_source = candidate_source or "SOURCE_NOT_STORED"
                 breakout_date = asof
                 breakout_active = True
             elif updated_rebase.active:
@@ -230,6 +233,14 @@ def replay_symbol(
         if updated_rebase.active:
             breakout_active = False
 
+        next_pivot_candidate = None
+        next_pivot_candidate_source = None
+        if active_candidate_pivot is not None and (
+            not breakout_active or breakout_pivot is None or abs(float(active_candidate_pivot) - float(breakout_pivot)) > 1e-9
+        ):
+            next_pivot_candidate = float(active_candidate_pivot)
+            next_pivot_candidate_source = candidate_source
+
         rows.append({
             "ticker": symbol.upper(),
             "as_of_date": asof.isoformat(),
@@ -239,7 +250,11 @@ def replay_symbol(
             "pattern": pattern_name,
             "pattern_start_date": candidate_start.isoformat() if candidate_start else None,
             "candidate_pivot": candidate_pivot,
+            "candidate_pivot_source": candidate_source,
             "breakout_pivot": breakout_pivot,
+            "breakout_pivot_source": breakout_pivot_source,
+            "next_pivot_candidate": next_pivot_candidate,
+            "next_pivot_candidate_source": next_pivot_candidate_source,
             "breakout_date": breakout_date.isoformat() if breakout_date else None,
             "breakout_cycle_active": breakout_active,
             "stage": stage.stage.value,

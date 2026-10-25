@@ -385,29 +385,39 @@ def _compatible_seed(bars: pd.DataFrame, seed: dict[str, Any] | None) -> bool:
 
 
 def _history_snapshot(symbol: str, bars: pd.DataFrame, seed: dict[str, Any] | None) -> tuple[dict[str, Any], str]:
+    def _with_recent_history(state: dict[str, Any], history: pd.DataFrame | None) -> dict[str, Any]:
+        out = dict(state)
+        rows: list[dict[str, Any]] = []
+        if history is not None and not history.empty and {"as_of_date", "stage"}.issubset(history.columns):
+            rows.extend(history[["as_of_date", "stage"]].tail(5).to_dict("records"))
+        if not rows and out.get("as_of_date") and out.get("stage"):
+            rows = [{"as_of_date": out.get("as_of_date"), "stage": out.get("stage")}]
+        out["_recent_official_states"] = rows[-5:]
+        return out
+
     if _compatible_seed(bars, seed):
         seed_date = pd.Timestamp(seed["as_of_date"]).normalize()
         if bars["Date"].max() <= seed_date:
-            return dict(seed), "BUNDLED_REPLAY_SNAPSHOT"
-        replay = replay_symbol(
-            symbol,
-            bars,
-            resume_snapshot=seed,
-            process_from_date=seed_date,
-        )
+            return _with_recent_history(dict(seed), None), "BUNDLED_REPLAY_SNAPSHOT"
+        replay = replay_symbol(symbol, bars, resume_snapshot=seed, process_from_date=seed_date)
         if not replay.empty:
-            return replay.iloc[-1].to_dict(), "INCREMENTAL_FROM_BUNDLED_SNAPSHOT"
-        return dict(seed), "BUNDLED_REPLAY_SNAPSHOT"
+            history_rows: list[dict[str, Any]] = []
+            if seed.get("as_of_date") and seed.get("stage"):
+                history_rows.append({"as_of_date": seed.get("as_of_date"), "stage": seed.get("stage")})
+            history_rows.extend(replay[["as_of_date", "stage"]].to_dict("records"))
+            latest = replay.iloc[-1].to_dict()
+            latest["_recent_official_states"] = history_rows[-5:]
+            return latest, "INCREMENTAL_FROM_BUNDLED_SNAPSHOT"
+        return _with_recent_history(dict(seed), None), "BUNDLED_REPLAY_SNAPSHOT"
 
-    # For symbols without a compatible seed, use a transparent 300-bar rolling
-    # replay. The extra warm-up context is required to reconstruct current
-    # Base-on-Base patterns whose first-base breakout precedes the normal
-    # 120-bar detector window. This still is not a full multi-year history.
+    # Use the canonical rolling window used by the V2 chronological engine.
     rolling = bars.tail(300).reset_index(drop=True)
     replay = replay_symbol(symbol, rolling)
     if replay.empty:
         return {}, "NO_REPLAY_RESULT"
-    return replay.iloc[-1].to_dict(), "ROLLING_300_BAR_REPLAY"
+    latest = replay.iloc[-1].to_dict()
+    latest["_recent_official_states"] = replay[["as_of_date", "stage"]].tail(5).to_dict("records")
+    return latest, "ROLLING_300_BAR_REPLAY"
 
 
 def analyze_symbol(
@@ -531,8 +541,13 @@ def analyze_symbol(
         "detected_pattern_diagnostic": detected_pattern,
         "pattern_start_date": _date_string(state.get("pattern_start_date")),
         "candidate_pivot": candidate_pivot,
+        "candidate_pivot_source": (str(state.get("candidate_pivot_source") or ("REBASE_FORMING" if bool(state.get("rebase_active", False)) else "SOURCE_NOT_STORED")) if candidate_pivot is not None or bool(state.get("rebase_active", False)) else None),
         "candidate_distance_pct": _pct(candidate_distance),
+        "pattern_upper": candidate_pivot,
         "breakout_pivot": breakout_pivot,
+        "breakout_pivot_source": (str(state.get("breakout_pivot_source") or "HISTORICAL_SOURCE_NOT_STORED") if breakout_pivot is not None else None),
+        "next_pivot_candidate": _num(state.get("next_pivot_candidate")),
+        "next_pivot_candidate_source": state.get("next_pivot_candidate_source"),
         "breakout_distance_pct": _pct(breakout_distance),
         "twenty_day_reference": twenty_ref,
         "twenty_day_distance_pct": _pct(twenty_distance),
@@ -559,6 +574,7 @@ def analyze_symbol(
         "pocket_pivot_reason": "|".join(pp.reason_codes),
         "data_rows": len(bars),
         "replay_provenance": provenance,
+        "recent_official_states": list(state.get("_recent_official_states") or []),
         "validation_status": str(state.get("validation_status") or "OBSERVED_NOT_VALIDATED"),
         "bars": bars,
     }
