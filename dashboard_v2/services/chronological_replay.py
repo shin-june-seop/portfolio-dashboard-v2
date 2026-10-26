@@ -38,10 +38,18 @@ def replay_symbol(
     If omitted, the replay does not invent a historical breakout event.
     """
     bars = normalize_ohlcv(raw_frame)
+    # Match screening_service's EOD RVOL definition exactly: current completed
+    # session volume divided by the mean volume of the prior 20 completed bars,
+    # excluding the current bar. Compute before start_date filtering so a resumed
+    # or date-scoped replay still has the correct preceding volume context.
+    prior_volume_average = bars["Volume"].rolling(window=20, min_periods=20).mean().shift(1)
+    eod_rvol_values = bars["Volume"].divide(prior_volume_average.where(prior_volume_average > 0))
     if start_date is not None:
-        bars = bars.loc[bars["Date"] >= pd.Timestamp(start_date)].reset_index(drop=True)
+        eligible = bars["Date"] >= pd.Timestamp(start_date)
+        bars = bars.loc[eligible].reset_index(drop=True)
+        eod_rvol_values = eod_rvol_values.loc[eligible].reset_index(drop=True)
     if bars.empty:
-        return pd.DataFrame(columns=["ticker", "as_of_date", "pattern", "candidate_pivot", "breakout_pivot", "stage", "rebase_active", "rebase_started_at", "rebase_reason", "breakout_event", "breakout_failure", "validation_status"])
+        return pd.DataFrame(columns=["ticker", "as_of_date", "open", "high", "low", "close", "volume", "eod_rvol", "pattern", "candidate_pivot", "breakout_pivot", "stage", "rebase_active", "rebase_started_at", "rebase_reason", "breakout_event", "breakout_failure", "validation_status"])
 
     candidate_pivot = initial_candidate_pivot
     breakout_pivot = initial_breakout_pivot
@@ -81,6 +89,10 @@ def replay_symbol(
             breakout_active = False
 
     rows: list[dict[str, Any]] = []
+    # Primary pattern detection repeatedly scans the latest three endpoints. Adjacent
+    # replay iterations overlap by two endpoints, so cache endpoint candidates for this
+    # one immutable OHLCV replay. Rebase/breakout parameters are part of the cache key.
+    pattern_endpoint_cache: dict[tuple, Any] = {}
 
     for idx in range(len(bars)):
         # `bars` was normalized once above. These chronological views are
@@ -91,6 +103,8 @@ def replay_symbol(
         if process_cutoff is not None and asof <= process_cutoff:
             continue
         close = float(bar["Close"])
+        raw_eod_rvol = eod_rvol_values.iloc[idx]
+        eod_rvol = float(raw_eod_rvol) if pd.notna(raw_eod_rvol) and float(raw_eod_rvol) >= 0 else None
         prior_candidate = candidate_pivot
         prior_breakout = breakout_pivot
         prior_breakout_active = breakout_active
@@ -130,10 +144,15 @@ def replay_symbol(
             "prior_breakout_date": detector_breakout_date,
         }
         if pattern_detector is detect_primary_pattern:
-            # Only the built-in detector gets the internal fast path; injected
+            # Only the built-in detector gets the incremental endpoint cache; injected
             # test/custom detectors keep their existing validated call contract.
-            detector_kwargs["_normalized"] = True
-        candidate = pattern_detector(detector_history, **detector_kwargs)
+            candidate = pattern_detector(
+                detector_history,
+                **detector_kwargs,
+                _endpoint_cache=pattern_endpoint_cache,
+            )
+        else:
+            candidate = pattern_detector(detector_history, **detector_kwargs)
         valid_candidate = bool(candidate and candidate.valid and candidate.candidate_pivot and candidate.pattern_start_date)
 
         # A valid new-cycle structure ends a rebase only when no fresh trigger is
@@ -192,6 +211,7 @@ def replay_symbol(
             breakout_cycle_active=breakout_active,
             next_pivot=active_candidate_pivot,
             next_pivot_valid=active_candidate_pivot is not None,
+            eod_rvol=eod_rvol,
         ))
 
         if stage.breakout_failure:
@@ -231,6 +251,7 @@ def replay_symbol(
             "as_of_date": asof.isoformat(),
             "open": float(bar["Open"]), "high": float(bar["High"]),
             "low": float(bar["Low"]), "close": close, "volume": int(bar["Volume"]),
+            "eod_rvol": eod_rvol,
             "pattern": pattern_name,
             "pattern_start_date": candidate_start.isoformat() if candidate_start else None,
             "candidate_pivot": candidate_pivot,
