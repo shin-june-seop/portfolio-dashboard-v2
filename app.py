@@ -172,8 +172,17 @@ def _load_seed_state() -> dict:
     return load_seed_snapshots()
 
 
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def _analyze_cached(symbol: str, bars: pd.DataFrame, seed_snapshot: dict | None, benchmark: pd.DataFrame | None) -> dict:
+# Bump when analysis result schema or internal profiling changes. The explicit
+# argument invalidates Streamlit's cached EOD rows after a service-code deployment.
+_ANALYSIS_CACHE_SCHEMA_VERSION = "phase23-source-profile-v1"
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _analyze_cached(
+    symbol: str, bars: pd.DataFrame, seed_snapshot: dict | None,
+    benchmark: pd.DataFrame | None, cache_schema_version: str,
+) -> dict:
+    # cache_schema_version participates in Streamlit's key; the service owns logic.
     return analyze_symbol(symbol, bars, seed_snapshot=seed_snapshot, benchmark_bars=benchmark)
 
 
@@ -199,7 +208,9 @@ def _run_scan(
     caller's watchlist order so the UI is stable regardless of completion order.
     """
     start = time.perf_counter()
+    seed_started = time.perf_counter()
     seed = _load_seed_state()
+    seed_load_seconds = time.perf_counter() - seed_started
     requested = list(dict.fromkeys(str(s).upper().strip() for s in symbols if str(s).strip()))
     errors: list[tuple[str, str]] = []
     fetched: dict[str, pd.DataFrame] = {}
@@ -208,19 +219,26 @@ def _run_scan(
     # hashing/lookup on hits and the actual work on misses.
     download_diagnostics: list[dict[str, Any]] = []
     analysis_diagnostics: list[dict[str, Any]] = []
+    progress_callback_seconds = 0.0
+    progress_callback_calls = 0
     download_symbols = list(requested)
     if source == "Yahoo Finance (EOD)" and "SPY" not in download_symbols:
         download_symbols.append("SPY")
     download_total = len(download_symbols)
 
     def notify(stage: str, done: int, total: int, symbol: str) -> None:
+        nonlocal progress_callback_seconds, progress_callback_calls
         if progress_callback is None:
             return
+        callback_started = time.perf_counter()
+        progress_callback_calls += 1
         try:
             progress_callback(stage, done, total, symbol)
         except Exception:
             # UI progress must never affect data acquisition or engine output.
             pass
+        finally:
+            progress_callback_seconds += time.perf_counter() - callback_started
 
     # Yahoo/network latency is the main first-run bottleneck. Bounded concurrency
     # avoids serial 15-second waits while not launching one thread per watchlist item.
@@ -232,6 +250,7 @@ def _run_scan(
         except Exception as exc:
             return None, time.perf_counter() - started_at, exc
 
+    download_phase_started = time.perf_counter()
     notify("download", 0, max(1, download_total), "시작")
     if download_symbols:
         workers = min(6, len(download_symbols))
@@ -268,6 +287,7 @@ def _run_scan(
                     })
                     errors.append((label, f"{type(exc).__name__}: {exc}"))
                 notify("download", completed, download_total, ticker)
+    download_wall_seconds = time.perf_counter() - download_phase_started
 
     raw = {ticker: fetched[ticker] for ticker in requested if ticker in fetched}
     benchmark = fetched.get("SPY") if source == "Yahoo Finance (EOD)" else None
@@ -278,12 +298,13 @@ def _run_scan(
     def _timed_analysis(ticker: str, bars: pd.DataFrame):
         started_at = time.perf_counter()
         try:
-            result = _analyze_cached(ticker, bars, seed.get(ticker), benchmark)
+            result = _analyze_cached(ticker, bars, seed.get(ticker), benchmark, _ANALYSIS_CACHE_SCHEMA_VERSION)
             return result, time.perf_counter() - started_at, None
         except Exception as exc:
             return None, time.perf_counter() - started_at, exc
 
     rows_by_symbol: dict[str, dict[str, Any]] = {}
+    analysis_phase_started = time.perf_counter()
     if raw:
         notify("analysis", 0, len(raw), "시작")
         with ThreadPoolExecutor(max_workers=min(4, len(raw)), thread_name_prefix="v2-eod-engine") as pool:
@@ -306,8 +327,28 @@ def _run_scan(
                         })
                     else:
                         rows_by_symbol[ticker] = result
+                        profile = result.get("performance_profile") if isinstance(result, dict) else None
+                        profile = profile if isinstance(profile, dict) else {}
                         analysis_diagnostics.append({
-                            "종목": ticker, "소요시간(초)": round(float(seconds), 3),
+                            "종목": ticker,
+                            "소요시간(초)": round(float(seconds), 3),
+                            "내부 분석 계측(초)": profile.get("analyze_total_seconds"),
+                            "Replay 전체(초)": profile.get("replay_total_seconds"),
+                            "패턴 탐지(초)": profile.get("replay_pattern_seconds"),
+                            "재베이스 처리(초)": profile.get("replay_rebase_seconds"),
+                            "Stage 처리(초)": profile.get("replay_stage_seconds"),
+                            "후처리 패턴 탐지(초)": profile.get("diagnostic_pattern_seconds"),
+                            "Replay 처리 봉수": profile.get("replay_bars_processed"),
+                            "Replay 루프 기타(초)": profile.get("replay_loop_other_seconds"),
+                            "과거 돌파 복원 전체(초)": profile.get("recovery_seconds"),
+                            "과거 이벤트 원장 로드(초)": profile.get("historical_recovery_seed_ledger_load_seconds"),
+                            "과거 이벤트 정규화(초)": profile.get("historical_recovery_normalize_seconds"),
+                            "과거 이벤트 패턴 탐지(초)": profile.get("historical_recovery_pattern_seconds"),
+                            "과거 이벤트 후보 수": profile.get("historical_recovery_events_considered"),
+                            "과거 이벤트 재검증 수": profile.get("historical_recovery_events_revalidated"),
+                            "20D/RS 지표(초)": profile.get("derived_metrics_seconds"),
+                            "Pocket Pivot(초)": profile.get("pocket_pivot_seconds"),
+                            "분석 미분류(초)": profile.get("unclassified_analyze_seconds"),
                             "일봉 수": int(result.get("data_rows", len(raw[ticker]))),
                             "재생 경로": str(result.get("replay_provenance", "알 수 없음")),
                             "오류": "",
@@ -320,14 +361,32 @@ def _run_scan(
                         "오류": f"{type(exc).__name__}: {exc}",
                     })
                 notify("analysis", completed, len(raw), ticker)
+    analysis_wall_seconds = time.perf_counter() - analysis_phase_started
 
+    assembly_started = time.perf_counter()
     rows = [rows_by_symbol[ticker] for ticker in requested if ticker in rows_by_symbol]
+    assembly_seconds = time.perf_counter() - assembly_started
     elapsed = time.perf_counter() - start
+    other_wall_seconds = max(0.0, elapsed - seed_load_seconds - download_wall_seconds - analysis_wall_seconds - assembly_seconds)
+    phase_wall_clock = {
+        "seed_load_seconds": round(float(seed_load_seconds), 6),
+        "download_wall_seconds": round(float(download_wall_seconds), 6),
+        "analysis_wall_seconds": round(float(analysis_wall_seconds), 6),
+        "assembly_seconds": round(float(assembly_seconds), 6),
+        "other_wall_seconds": round(float(other_wall_seconds), 6),
+        # This is a subcomponent of download/analysis wall time, not an additive
+        # phase. It reveals if Streamlit progress rendering dominates a scan.
+        "progress_callback_seconds": round(float(progress_callback_seconds), 6),
+        "progress_callback_calls": int(progress_callback_calls),
+        "wall_excluding_progress_callback_seconds": round(max(0.0, elapsed - progress_callback_seconds), 6),
+        "total_seconds": round(float(elapsed), 6),
+    }
     if diagnostics_callback is not None:
         try:
             diagnostics_callback({
                 "download": sorted(download_diagnostics, key=lambda item: item.get("소요시간(초)") or 0, reverse=True),
                 "analysis": sorted(analysis_diagnostics, key=lambda item: item.get("소요시간(초)") or 0, reverse=True),
+                "phase_wall_clock": phase_wall_clock,
                 "total_seconds": round(float(elapsed), 3),
                 "download_workers": min(6, len(download_symbols)) if download_symbols else 0,
                 "analysis_workers": min(4, len(raw)) if raw else 0,
@@ -335,6 +394,8 @@ def _run_scan(
         except Exception:
             # Diagnostics must not change scan results.
             pass
+    # Include final result construction and the diagnostics callback in returned wall time.
+    elapsed = time.perf_counter() - start
     return pd.DataFrame(rows), raw, errors, elapsed
 
 
@@ -1033,6 +1094,28 @@ def _live_pct_text(value: Any) -> str:
         return "—"
 
 
+def _normalize_pivot_source(value: Any) -> str | None:
+    """Normalize missing/legacy source markers without presenting them as provenance."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    if text.upper() in {
+        "", "NAN", "NONE", "NULL", "—", "-", "SOURCE_NOT_STORED",
+        "HISTORICAL_SOURCE_NOT_STORED", "REBASE_FORMING",
+    }:
+        return None
+    return text
+
+
+def _pivot_source_display(value: Any) -> str:
+    return _normalize_pivot_source(value) or "—"
+
+
 def _live_pattern_text(value: Any, *, rebase_active: bool = False) -> str:
     pattern = str(value or "—").strip()
     if rebase_active or pattern.upper() in {"BASE FORMING / NO VALID PATTERN", "BASE FORMING", "NONE", "NAN", ""}:
@@ -1116,6 +1199,7 @@ def _render_live_monitor_page(
         bars_by_symbol: dict[str, pd.DataFrame] = {}
         live_rows: list[dict[str, Any]] = []
         live_errors: list[tuple[str, str]] = []
+        pivot_source_diagnostics: list[dict[str, Any]] = []
 
         def load_intraday_one(symbol: str):
             try:
@@ -1137,14 +1221,27 @@ def _render_live_monitor_page(
             breakout_pivot = _num_or_none((baseline or {}).get("breakout_pivot"))
             twenty_ref = _num_or_none((baseline or {}).get("twenty_day_reference"))
             breakout_active = bool((baseline or {}).get("breakout_cycle_active", False))
-            candidate_source = str((baseline or {}).get("candidate_pivot_source") or ("SOURCE_NOT_STORED" if candidate_pivot is not None else "—"))
-            breakout_source = str((baseline or {}).get("breakout_pivot_source") or ("HISTORICAL_SOURCE_NOT_STORED" if breakout_pivot is not None else "—"))
+            candidate_source = _normalize_pivot_source((baseline or {}).get("candidate_pivot_source"))
+            breakout_source = _normalize_pivot_source((baseline or {}).get("breakout_pivot_source"))
             next_pivot = _num_or_none((baseline or {}).get("next_pivot_candidate"))
-            next_source = str((baseline or {}).get("next_pivot_candidate_source") or "—")
+            next_source = _normalize_pivot_source((baseline or {}).get("next_pivot_candidate_source"))
             if breakout_active and candidate_pivot is not None and (breakout_pivot is None or abs(candidate_pivot - breakout_pivot) > 1e-9):
                 next_pivot, next_source = candidate_pivot, candidate_source
             elif next_pivot is None and candidate_pivot is not None and not breakout_active:
                 next_pivot, next_source = candidate_pivot, candidate_source
+
+            for field_label, price, source_value in (
+                ("Candidate Pivot", candidate_pivot, candidate_source),
+                ("돌파 Pivot", breakout_pivot, breakout_source),
+                ("Next Pivot", next_pivot, next_source),
+            ):
+                if price is not None and _normalize_pivot_source(source_value) is None:
+                    pivot_source_diagnostics.append({
+                        "종목": key,
+                        "필드": field_label,
+                        "가격": float(price),
+                        "진단": "가격은 있으나 유효한 출처 메타데이터가 없음",
+                    })
 
             if fetch_error or intraday_bars is None or intraday_bars.empty:
                 live_errors.append((key, fetch_error or "LiveMarketDataError: no intraday bars"))
@@ -1244,7 +1341,7 @@ def _render_live_monitor_page(
                     "live_quality_detail": quality.get("detail", ""),
                     "live_price": live_price, "change_pct": change_pct,
                     "pattern": _live_pattern_text(pattern_raw, rebase_active=bool((baseline or {}).get("rebase_active", False))),
-                    "pattern_upper": _num_or_none((baseline or {}).get("pattern_upper", candidate_pivot)),
+                    "pattern_upper": _num_or_none((baseline or {}).get("pattern_upper")),
                     "candidate_pivot": candidate_pivot, "candidate_source": candidate_source,
                     "twenty_day_reference": twenty_ref, "breakout_pivot": breakout_pivot, "breakout_source": breakout_source,
                     "next_pivot": next_pivot, "next_source": next_source, "pivot_distance_pct": pivot_distance,
@@ -1308,9 +1405,9 @@ def _render_live_monitor_page(
         display["ENTRY STAGE"] = display["entry_stage"]
         display["LIVE STATE"] = display["live_state"]
         display["LIVE ENTRY QUALITY"] = display["live_quality"]
-        display["Candidate Source"] = display["candidate_source"].fillna("—")
-        display["돌파 Pivot Source"] = display["breakout_source"].fillna("—")
-        display["Next Pivot Source"] = display["next_source"].fillna("—")
+        display["Candidate Source"] = display["candidate_source"].map(_pivot_source_display)
+        display["돌파 Pivot Source"] = display["breakout_source"].map(_pivot_source_display)
+        display["Next Pivot Source"] = display["next_source"].map(_pivot_source_display)
         display["최근 공식 상태"] = display["recent_official_state"].fillna("—")
         display["내 매수 이력"] = display["buy_history"].fillna("—")
         display["업데이트"] = display["updated"].fillna("—")
@@ -1322,6 +1419,14 @@ def _render_live_monitor_page(
         ]
         display = display[columns].rename(columns={"ticker": "종목", "pattern": "Pattern"})
         st.dataframe(display, use_container_width=True, hide_index=True, height=min(680, max(220, 40 + 36 * len(display))))
+        if pivot_source_diagnostics:
+            with st.expander(f"피벗 출처 누락 진단 ({len(pivot_source_diagnostics)})", expanded=False):
+                st.caption("표시 가격은 존재하지만 출처 값이 없거나 기존 SOURCE_NOT_STORED 표시였던 항목입니다. 출처 메타데이터가 없다는 뜻이며, 가격 계산 오류를 단독으로 의미하지는 않습니다.")
+                source_diag_frame = pd.DataFrame(pivot_source_diagnostics)
+                source_diag_frame["가격"] = source_diag_frame["가격"].map(_live_price_text)
+                st.dataframe(source_diag_frame, use_container_width=True, hide_index=True)
+        else:
+            st.caption("피벗 출처 진단: 가격이 존재하는 피벗의 출처 메타데이터 누락은 없습니다.")
 
         quality_rows = frame.loc[frame["live_quality"].astype(str).ne("—")].copy()
         if not quality_rows.empty:
@@ -1429,7 +1534,7 @@ def _render_momentum_chart_section(
                         benchmark_spy = _load_yfinance_bars("SPY")
                     except Exception:
                         benchmark_spy = None
-                official = _analyze_cached(ticker, daily, _load_seed_state().get(ticker), benchmark_spy)
+                official = _analyze_cached(ticker, daily, _load_seed_state().get(ticker), benchmark_spy, _ANALYSIS_CACHE_SCHEMA_VERSION)
             levels = {
                 "candidate": official.get("candidate_pivot"),
                 "candidate_source": official.get("candidate_pivot_source"),
@@ -2494,10 +2599,28 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
         )
         with st.expander("종목별 상세 성능 진단", expanded=False):
             st.caption(
-                "종목별 시간은 병렬 작업 각각의 경과 시간이라 합계가 화면 전체 시간과 같지 않습니다. "
-                "첫 실행과 같은 기준일로 재실행했을 때 엔진 호출 시간이 크게 줄면 캐시가 정상적으로 재사용되는 것입니다. "
-                "재생 경로가 ROLLING_260_BAR_REPLAY인 종목은 저장된 호환 스냅샷 없이 최근 260개 봉을 재생합니다."
+                "개별 ‘소요시간(초)’은 이번 실행에서 캐시 함수 호출에 걸린 시간이고, 내부 계측 열은 반환된 계산 결과가 마지막으로 생성될 때 측정된 시간입니다. "
+                "따라서 캐시 적중 시 호출 시간은 매우 짧아도 내부 계산 프로파일은 긴 값일 수 있습니다. "
+                "Replay 내부에서 패턴 탐지·재베이스·Stage가 차지하는 시간과 전체 단계의 벽시계 시간을 나눠 확인하세요."
             )
+            phase_timing = scan_diagnostics.get("phase_wall_clock", {})
+            if phase_timing:
+                phase_rows = [
+                    {"단계": "Seed / 상태 로드", "소요시간(초)": phase_timing.get("seed_load_seconds")},
+                    {"단계": "다운로드 단계 전체(진행률 UI 포함)", "소요시간(초)": phase_timing.get("download_wall_seconds")},
+                    {"단계": "EOD 분석 단계 전체(진행률 UI 포함)", "소요시간(초)": phase_timing.get("analysis_wall_seconds")},
+                    {"단계": "결과 조립", "소요시간(초)": phase_timing.get("assembly_seconds")},
+                    {"단계": "기타/진단 콜백·오버헤드", "소요시간(초)": phase_timing.get("other_wall_seconds")},
+                    {"단계": "진행률 UI 콜백(위 단계에 포함)", "소요시간(초)": phase_timing.get("progress_callback_seconds")},
+                    {"단계": "UI 콜백 제외 벽시계(비가산 참고)", "소요시간(초)": phase_timing.get("wall_excluding_progress_callback_seconds")},
+                    {"단계": "_run_scan 전체", "소요시간(초)": phase_timing.get("total_seconds")},
+                ]
+                st.markdown("**단계별 벽시계 시간**")
+                st.caption(
+                    f"진행률 UI 콜백 {phase_timing.get('progress_callback_calls', 0)}회. "
+                    "진행률 콜백 시간은 다운로드/분석 단계 시간에 이미 포함됩니다. 콜백 제외 벽시계도 참고 지표이며, 두 행은 단계 합계에 더하지 않습니다."
+                )
+                st.dataframe(pd.DataFrame(phase_rows), use_container_width=True, hide_index=True)
             diag_left, diag_right = st.columns(2)
             download_diag = pd.DataFrame(scan_diagnostics.get("download", []))
             analysis_diag = pd.DataFrame(scan_diagnostics.get("analysis", []))
