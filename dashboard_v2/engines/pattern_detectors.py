@@ -55,23 +55,48 @@ def _segment(df: pd.DataFrame, start: int, end: int) -> pd.DataFrame:
 
 
 def _local_extrema(values: np.ndarray, *, kind: str, order: int = 2) -> list[int]:
-    """Return simple local maxima/minima; flat plateaus are intentionally skipped."""
-    points: list[int] = []
+    """Return simple local maxima/minima; flat plateaus are intentionally skipped.
+
+    Use a vectorized sliding window instead of performing millions of tiny Python
+    ``all`` calls during historical replay. The comparisons preserve the existing
+    strict-left / non-strict-right tie policy exactly.
+    """
     if len(values) < order * 2 + 1:
-        return points
-    for i in range(order, len(values) - order):
-        value = values[i]
+        return []
+    values = np.asarray(values)
+    center = values[order:-order]
+    left_valid = np.ones(len(center), dtype=bool)
+    right_valid = np.ones(len(center), dtype=bool)
+    # A handful of aligned vector comparisons is cheaper than creating a
+    # sliding-window view thousands of times for short candidate segments.
+    for offset in range(1, order + 1):
+        left = values[order - offset:len(values) - order - offset]
+        right = values[order + offset:len(values) - order + offset]
         if kind == "max":
-            if all(value > values[j] for j in range(i - order, i)) and all(
-                value >= values[j] for j in range(i + 1, i + order + 1)
-            ):
-                points.append(i)
+            left_valid &= center > left
+            right_valid &= center >= right
         elif kind == "min":
-            if all(value < values[j] for j in range(i - order, i)) and all(
-                value <= values[j] for j in range(i + 1, i + order + 1)
-            ):
-                points.append(i)
-    return points
+            left_valid &= center < left
+            right_valid &= center <= right
+        else:
+            return []
+    return (np.flatnonzero(left_valid & right_valid) + order).astype(int).tolist()
+
+
+def _extrema_in_slice(points: np.ndarray, start: int, end: int, *, order: int) -> list[int]:
+    """Translate whole-frame extrema into a slice's positional coordinates.
+
+    Any point at least `order` bars inside a slice has the same neighbours as in
+    the whole frame, so this filtering is exactly equivalent to rescanning each
+    individual segment and avoids repeated extrema work across overlapping bases.
+    """
+    lo = start + order
+    hi = end - order
+    if hi < lo or points.size == 0:
+        return []
+    left = int(np.searchsorted(points, lo, side="left"))
+    right = int(np.searchsorted(points, hi, side="right"))
+    return (points[left:right] - start).astype(int).tolist()
 
 
 def _valid_after_rebase(df: pd.DataFrame, start_idx: int, rebase_started_at: date | str | None) -> bool:
@@ -81,7 +106,7 @@ def _valid_after_rebase(df: pd.DataFrame, start_idx: int, rebase_started_at: dat
     # once per normalized scan instead of converting a pandas scalar to a date for
     # every possible formation start.
     boundary = df.attrs.get("_v2_rebase_start_index")
-    if boundary is not None and df.attrs.get("_v2_rebase_start_date") == str(pd.Timestamp(rebase_started_at).date()):
+    if boundary is not None:
         return start_idx >= boundary
     start = pd.Timestamp(rebase_started_at).date()
     return _d(df["Date"].iat[start_idx]) >= start
@@ -109,19 +134,24 @@ def _ends(n: int, *, max_age: int = DEFAULT_FORMATION_END_LOOKBACK) -> range:
 def detect_double_bottom(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
+    # Materialize each column once. Creating thousands of tiny pandas slices in
+    # the chronological replay is expensive and does not change these reductions.
+    highs_all = df["High"].to_numpy(float)
+    lows_all = df["Low"].to_numpy(float)
+    closes_all = df["Close"].to_numpy(float)
+    low_extrema_all = np.asarray(_local_extrema(lows_all, kind="min", order=2), dtype=int)
     # Search longer structures first at each recent endpoint.
     for end in _ends(n):
         for length in range(min(PS.double_bottom_max_bars, end + 1), PS.double_bottom_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
                 continue
-            s = _segment(df, start, end)
-            m = len(s)
-            lows = s["Low"].to_numpy(float)
-            highs = s["High"].to_numpy(float)
+            m = length
+            lows = lows_all[start:end + 1]
+            highs = highs_all[start:end + 1]
             # Require actual interior swing lows. Choosing the lowest point of each
             # half without swing validation falsely labels a monotonic rise as a W base.
-            troughs = _local_extrema(lows, kind="min", order=2)
+            troughs = _extrema_in_slice(low_extrema_all, start, end, order=2)
             split = int(m * 0.53)
             left_troughs = [i for i in troughs if 3 <= i < split]
             right_troughs = [i for i in troughs if split <= i < m - 3]
@@ -141,7 +171,7 @@ def detect_double_bottom(frame: pd.DataFrame, *, rebase_started_at: date | str |
                     depth = (base_high - low1) / base_high if base_high > 0 else 1.0
                     if depth > PS.double_bottom_max_depth:
                         continue
-                    if float(s.iloc[-1]["Close"]) < low2 * 0.97:
+                    if closes_all[end] < low2 * 0.97:
                         continue
                     # Prefer the latest second trough, and within that the closer low pair.
                     rank = (i2, -abs(low2 / low1 - 1))
@@ -152,8 +182,8 @@ def detect_double_bottom(frame: pd.DataFrame, *, rebase_started_at: date | str |
             _, i1, i2, low1, low2, middle_high, rebound, depth = best
             pivot = float(np.max(highs[i1 + 1:i2]))
             return _candidate("Double Bottom", df, start, end, pivot,
-                              diagnostics={"low1_date": str(_d(s.iloc[i1]["Date"])),
-                                           "low2_date": str(_d(s.iloc[i2]["Date"])),
+                              diagnostics={"low1_date": str(_d(df.iloc[start + i1]["Date"])),
+                                           "low2_date": str(_d(df.iloc[start + i2]["Date"])),
                                            "low1": float(low1), "low2": float(low2),
                                            "middle_rebound_pct": round(rebound * 100, 2),
                                            "base_depth_pct": round(depth * 100, 2)})
@@ -285,19 +315,21 @@ def detect_cup_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | No
 def detect_cup_without_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
+    highs_all = df["High"].to_numpy(float)
+    lows_all = df["Low"].to_numpy(float)
     for end in _ends(n):
         for length in range(min(PS.cup_without_handle_max_bars, end + 1), PS.cup_without_handle_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
                 continue
-            s = _segment(df, start, end)
-            shape = _cup_shape(s, min_depth=PS.cup_without_handle_min_depth, max_depth=PS.cup_without_handle_max_depth)
+            highs = highs_all[start:end + 1]
+            lows = lows_all[start:end + 1]
+            shape = _cup_shape_arrays(highs, lows, min_depth=PS.cup_without_handle_min_depth,
+                                      max_depth=PS.cup_without_handle_max_depth)
             if shape is None:
                 continue
             # Validate all highs and the entire recovery path, not just lows that
             # occur after the selected right rim. This blocks unstable cup bodies.
-            highs = s["High"].to_numpy(float)
-            lows = s["Low"].to_numpy(float)
             cup_quality = _cup_path_quality(highs, lows, shape)
             if cup_quality is None:
                 continue
@@ -307,9 +339,9 @@ def detect_cup_without_handle(frame: pd.DataFrame, *, rebase_started_at: date | 
 
             # Keep the explicit post-rim guard as a readable invariant: any substantial
             # pullback after the right rim belongs to Cup & Handle, not Cup Without Handle.
-            post_rim_lows = s.iloc[right_idx:]["Low"]
+            post_rim_lows = lows[right_idx:]
             right_peak = shape["right_rim"]
-            pullback = (right_peak - float(post_rim_lows.min())) / right_peak
+            pullback = (right_peak - float(np.min(post_rim_lows))) / right_peak
             if pullback > PS.cup_without_handle_max_rim_pullback:
                 continue
             # Distinguish long/shallow rounded saucers below, leaving deeper/shorter cups here.
@@ -329,14 +361,18 @@ def detect_cup_without_handle(frame: pd.DataFrame, *, rebase_started_at: date | 
 def detect_flat_base(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
+    highs_all = df["High"].to_numpy(float)
+    lows_all = df["Low"].to_numpy(float)
+    closes_all = df["Close"].to_numpy(float)
     for end in _ends(n):
         for length in range(min(PS.flat_base_max_bars, end + 1), PS.flat_base_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
                 continue
-            s = _segment(df, start, end)
-            top = float(s["High"].max())
-            bottom = float(s["Low"].min())
+            highs = highs_all[start:end + 1]
+            lows = lows_all[start:end + 1]
+            top = float(np.max(highs))
+            bottom = float(np.min(lows))
             if top <= 0:
                 continue
             depth = (top - bottom) / top
@@ -344,16 +380,15 @@ def detect_flat_base(frame: pd.DataFrame, *, rebase_started_at: date | str | Non
                 continue
             # Require a prior advance, not an arbitrary range during a longer downtrend.
             prior_start = max(0, start - PS.flat_base_prior_lookback)
-            prior = df.iloc[prior_start:start]
-            if len(prior) < PS.flat_base_min_prior_bars:
+            if start - prior_start < PS.flat_base_min_prior_bars:
                 continue
-            prior_low = float(prior["Low"].min())
-            base_first_close = float(df.iloc[start]["Close"])
+            prior_low = float(np.min(lows_all[prior_start:start]))
+            base_first_close = float(closes_all[start])
             advance = base_first_close / prior_low - 1 if prior_low > 0 else -1
             if advance < PS.flat_base_prior_advance_min:
                 continue
             # Suppress a steadily trending base: range must be relatively balanced around a band.
-            closes = s["Close"].to_numpy(float)
+            closes = closes_all[start:end + 1]
             x = np.arange(len(closes), dtype=float)
             slope = float(np.polyfit(x, closes, 1)[0]) if len(closes) > 2 else 0.0
             normalized_slope = abs(slope) * (len(closes) - 1) / max(top, 1e-9)
@@ -369,14 +404,16 @@ def detect_flat_base(frame: pd.DataFrame, *, rebase_started_at: date | str | Non
 def detect_saucer_base(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
+    highs_all = df["High"].to_numpy(float)
+    lows_all = df["Low"].to_numpy(float)
+    low_extrema_order3 = np.asarray(_local_extrema(lows_all, kind="min", order=3), dtype=int)
     for end in _ends(n):
         for length in range(min(PS.saucer_max_bars, end + 1), PS.saucer_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
                 continue
-            s = _segment(df, start, end)
-            high = s["High"].to_numpy(float)
-            low = s["Low"].to_numpy(float)
+            high = highs_all[start:end + 1]
+            low = lows_all[start:end + 1]
             top = float(max(np.max(high[:max(3, int(length * .20))]), np.max(high[int(length * .80):])))
             bottom = float(np.min(low))
             if top <= 0:
@@ -396,7 +433,7 @@ def detect_saucer_base(frame: pd.DataFrame, *, rebase_started_at: date | str | N
             if abs(right_mean / left_mean - 1) > PS.saucer_rim_tolerance:
                 continue
             # A one- or two-week V snap-back is not a saucer.
-            low_local = _local_extrema(low, kind="min", order=3)
+            low_local = _extrema_in_slice(low_extrema_order3, start, end, order=3)
             if not low_local or min(abs(i - trough) for i in low_local) > 5:
                 continue
             return _candidate("Saucer Base", df, start, end, top,
@@ -409,16 +446,19 @@ def detect_saucer_base(frame: pd.DataFrame, *, rebase_started_at: date | str | N
 def detect_ascending_base(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
+    highs_all = df["High"].to_numpy(float)
+    lows_all = df["Low"].to_numpy(float)
+    high_extrema_all = np.asarray(_local_extrema(highs_all, kind="max", order=2), dtype=int)
+    low_extrema_all = np.asarray(_local_extrema(lows_all, kind="min", order=2), dtype=int)
     for end in _ends(n):
         for length in range(min(PS.ascending_base_max_bars, end + 1), PS.ascending_base_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
                 continue
-            s = _segment(df, start, end)
-            highs = s["High"].to_numpy(float)
-            lows = s["Low"].to_numpy(float)
-            peaks = _local_extrema(highs, kind="max", order=2)
-            troughs = _local_extrema(lows, kind="min", order=2)
+            highs = highs_all[start:end + 1]
+            lows = lows_all[start:end + 1]
+            peaks = _extrema_in_slice(high_extrema_all, start, end, order=2)
+            troughs = _extrema_in_slice(low_extrema_all, start, end, order=2)
             # Pair each peak with the next trough. Require three higher-high/higher-low pullbacks.
             pullbacks: list[tuple[int, int, float, float]] = []
             for peak in peaks:
@@ -454,20 +494,22 @@ def detect_ascending_base(frame: pd.DataFrame, *, rebase_started_at: date | str 
 def detect_high_tight_flag(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
+    highs_all = df["High"].to_numpy(float)
+    lows_all = df["Low"].to_numpy(float)
+    closes_all = df["Close"].to_numpy(float)
     for end in _ends(n):
         for flag_len in range(PS.high_tight_flag_max_bars, PS.high_tight_flag_min_bars - 1, -1):
             flag_start = end - flag_len + 1
             if flag_start < 1:
                 continue
-            flag = _segment(df, flag_start, end)
-            flag_high = float(flag["High"].max())
-            flag_low = float(flag["Low"].min())
+            flag_high = float(np.max(highs_all[flag_start:end + 1]))
+            flag_low = float(np.min(lows_all[flag_start:end + 1]))
             if flag_high <= 0 or (flag_high - flag_low) / flag_high > PS.high_tight_flag_max_depth:
                 continue
             # Locate a sharp pole ending just before flag start. Pole may pre-date a rebase cycle,
             # but its gain and the complete flag are always revalidated.
             pole_start_min = max(0, flag_start - PS.high_tight_flag_max_pole_bars)
-            pole_closes = df["Close"].to_numpy(float)[pole_start_min:flag_start]
+            pole_closes = closes_all[pole_start_min:flag_start]
             if len(pole_closes) < 5:
                 continue
             eligible = np.flatnonzero((pole_closes > 0) & (flag_high / np.maximum(pole_closes, 1e-9) - 1 >= PS.high_tight_flag_min_pole_gain))
@@ -479,13 +521,13 @@ def detect_high_tight_flag(frame: pd.DataFrame, *, rebase_started_at: date | str
                 if _d(df.iloc[flag_start]["Date"]) < rebase_date:
                     continue
             # Flag should be a sideways/downward consolidation after the pole, not a new vertical advance.
-            fclose = flag["Close"].to_numpy(float)
+            fclose = closes_all[flag_start:end + 1]
             trend = (fclose[-1] / fclose[0] - 1) if fclose[0] > 0 else 1.0
             if trend > PS.high_tight_flag_max_flag_advance:
                 continue
             return _candidate("High Tight Flag", df, pole_start, end, flag_high,
                               diagnostics={"pole_start_date": str(_d(df.iloc[pole_start]["Date"])),
-                                           "pole_gain_pct": round((flag_high / float(df.iloc[pole_start]["Close"]) - 1) * 100, 2),
+                                           "pole_gain_pct": round((flag_high / float(closes_all[pole_start]) - 1) * 100, 2),
                                            "flag_depth_pct": round((flag_high - flag_low) / flag_high * 100, 2),
                                            "flag_bars": flag_len})
     return None
@@ -494,20 +536,24 @@ def detect_high_tight_flag(frame: pd.DataFrame, *, rebase_started_at: date | str
 def detect_vcp(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
+    highs_all = df["High"].to_numpy(float)
+    lows_all = df["Low"].to_numpy(float)
+    volumes_all = df["Volume"].to_numpy(float)
+    high_extrema_all = np.asarray(_local_extrema(highs_all, kind="max", order=2), dtype=int)
+    low_extrema_all = np.asarray(_local_extrema(lows_all, kind="min", order=2), dtype=int)
     for end in _ends(n):
         for length in range(min(PS.vcp_max_bars, end + 1), PS.vcp_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
                 continue
-            s = _segment(df, start, end)
-            high = s["High"].to_numpy(float)
-            low = s["Low"].to_numpy(float)
-            vol = s["Volume"].to_numpy(float)
-            peaks = _local_extrema(high, kind="max", order=2)
-            troughs = _local_extrema(low, kind="min", order=2)
+            high = highs_all[start:end + 1]
+            low = lows_all[start:end + 1]
+            vol = volumes_all[start:end + 1]
+            peaks = _extrema_in_slice(high_extrema_all, start, end, order=2)
+            troughs = _extrema_in_slice(low_extrema_all, start, end, order=2)
             swings: list[dict] = []
             for pi, peak in enumerate(peaks):
-                next_peak = peaks[pi + 1] if pi + 1 < len(peaks) else len(s) - 1
+                next_peak = peaks[pi + 1] if pi + 1 < len(peaks) else len(high) - 1
                 cand_troughs = [t for t in troughs if peak < t < next_peak]
                 if not cand_troughs:
                     continue
@@ -567,6 +613,7 @@ def detect_base_on_base(frame: pd.DataFrame, *, prior_breakout_pivot: float | No
     n = len(df)
     closes = df["Close"].to_numpy(float)
     highs = df["High"].to_numpy(float)
+    lows = df["Low"].to_numpy(float)
     breakout_idx = None
     if prior_breakout_date is not None:
         event_date = pd.Timestamp(prior_breakout_date).date()
@@ -596,12 +643,14 @@ def detect_base_on_base(frame: pd.DataFrame, *, prior_breakout_pivot: float | No
             start = end - length + 1
             if start <= breakout_idx or not _valid_after_rebase(df, start, rebase_started_at):
                 continue
-            s = _segment(df, start, end)
-            top = float(s["High"].max())
-            bottom = float(s["Low"].min())
+            candidate_highs = highs[start:end + 1]
+            candidate_lows = lows[start:end + 1]
+            candidate_closes = closes[start:end + 1]
+            top = float(np.max(candidate_highs))
+            bottom = float(np.min(candidate_lows))
             if top <= 0 or (top - bottom) / top > PS.base_on_base_max_depth:
                 continue
-            above_ratio = float((s["Close"] > prior_breakout_pivot).mean())
+            above_ratio = float(np.mean(candidate_closes > prior_breakout_pivot))
             if above_ratio < PS.base_on_base_min_days_above_prior_pivot:
                 continue
             max_advance_pct = float(np.max(highs[breakout_idx:end + 1])) / prior_breakout_pivot - 1
@@ -620,13 +669,16 @@ def detect_pattern_candidates(
     rebase_started_at: date | str | None = None,
     prior_breakout_pivot: float | None = None,
     prior_breakout_date: date | str | None = None,
+    _normalized: bool = False,
 ) -> list[PatternCandidate]:
     """Run available V2 detector set and return every valid candidate for diagnostics.
 
     UI consumers must call ``select_primary_pattern`` and display only that one
     main pattern/pivot. Candidate detector diagnostics are for test/debug only.
     """
-    df = normalize_ohlcv(frame)
+    # Private replay fast path: chronological_replay already normalized and
+    # date-sorted the complete input, and each detector frame is only a slice of it.
+    df = frame if _normalized else normalize_ohlcv(frame)
     if df.empty:
         return []
     if rebase_started_at is not None:
@@ -636,6 +688,11 @@ def detect_pattern_candidates(
             date_values, np.datetime64(rebase_date, "ns"), side="left"
         ))
         df.attrs["_v2_rebase_start_date"] = str(rebase_date)
+    else:
+        # The replay fast path reuses slices of already normalized bars. Ensure an
+        # attribute from a prior day's detector call cannot leak into this scan.
+        df.attrs.pop("_v2_rebase_start_index", None)
+        df.attrs.pop("_v2_rebase_start_date", None)
     detectors: tuple[Callable[..., PatternCandidate | None], ...] = (
         detect_high_tight_flag,
         detect_vcp,
@@ -661,10 +718,11 @@ def detect_pattern_candidates(
 
 def detect_primary_pattern(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None,
                            prior_breakout_pivot: float | None = None,
-                           prior_breakout_date: date | str | None = None) -> PatternCandidate | None:
+                           prior_breakout_date: date | str | None = None,
+                           _normalized: bool = False) -> PatternCandidate | None:
     """Return the single pattern and candidate pivot used by downstream engines."""
     return select_primary_pattern(detect_pattern_candidates(
         frame, rebase_started_at=rebase_started_at,
         prior_breakout_pivot=prior_breakout_pivot,
-        prior_breakout_date=prior_breakout_date,
+        prior_breakout_date=prior_breakout_date, _normalized=_normalized,
     ))

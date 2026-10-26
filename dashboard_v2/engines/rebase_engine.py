@@ -16,6 +16,7 @@ def update_rebase_state(
     breakout_cycle_active: bool,
     previous_state: RebaseState | None = None,
     valid_new_pattern: bool = False,
+    _normalized: bool = False,
 ) -> RebaseState:
     """Evaluate RB-01/02/03 and preserve a single cycle until valid pattern found.
 
@@ -23,7 +24,9 @@ def update_rebase_state(
     current day's pattern scan, preventing circular comparison to a new pivot.
     The caller's input history must contain completed bars only.
     """
-    df = normalize_ohlcv(frame, as_of_date=as_of_date)
+    # The chronological replay passes an already normalized, bounded 20-bar
+    # slice. Keep the public validation path as the default for other callers.
+    df = frame if _normalized else normalize_ohlcv(frame, as_of_date=as_of_date)
     target_date = pd.Timestamp(as_of_date).date()
     is_rebasing = bool(previous_state and previous_state.active)
 
