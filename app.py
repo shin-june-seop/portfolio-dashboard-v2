@@ -89,7 +89,7 @@ ROOT = Path(__file__).resolve().parent
 PAGES = [
     "Watchlist", "Momentum Monitor", "Live Monitor", "Quality Recovery", "Pattern Scanner", "PP Journal",
     "Overview", "Holdings",
-    "Performance", "Allocation", "Chart", "Leaders",
+    "Performance", "Allocation", "Leaders",
 ]
 
 st.set_page_config(page_title="Portfolio Dashboard V2", page_icon="📊", layout="wide")
@@ -1348,15 +1348,29 @@ def _render_live_monitor_page(
     _live_monitor_fragment()
 
 
-def _render_chart_page(watchlist_rows: list[dict[str, Any]], source: str) -> None:
-    """Legacy-style Chart UI; official levels are read-only V2 EOD outputs."""
-    st.markdown("## 📊 Chart")
+def _render_momentum_chart_section(
+    watchlist_rows: list[dict[str, Any]],
+    source: str,
+    *,
+    scan_result: pd.DataFrame | None = None,
+    raw_by_ticker: Mapping[str, pd.DataFrame] | None = None,
+) -> None:
+    """Render the full legacy-style chart at the bottom of Momentum Monitor.
+
+    When the selected symbol is already part of the page's completed EOD scan,
+    reuse its daily bars and canonical EOD output rather than fetching/replaying
+    the same symbol a second time. Arbitrary manually entered symbols still use
+    the same read-only EOD analysis path as the former standalone Chart page.
+    """
+    st.markdown("---")
+    st.markdown("## 📈 종목 차트")
+    st.caption("모멘텀 모니터 내 차트 · 완료 일봉과 V2 공식 EOD 기준선 · 장중 봉은 시각화 전용")
     watch_symbols = active_tickers(watchlist_rows)
     c1, c2 = st.columns([1.2, 1])
     with c1:
-        selected = st.selectbox("관심종목", options=watch_symbols or ["—"], index=0, key="v2_chart_watchlist_ticker")
+        selected = st.selectbox("관심종목", options=watch_symbols or ["—"], index=0, key="v2_momentum_chart_watchlist_ticker")
     with c2:
-        typed = st.text_input("직접 입력 (아무 티커)", value="", key="v2_chart_typed_ticker", placeholder="예: AAPL").strip().upper()
+        typed = st.text_input("직접 입력 (아무 티커)", value="", key="v2_momentum_chart_typed_ticker", placeholder="예: AAPL").strip().upper()
     ticker = typed or (selected if selected != "—" else "")
     if not ticker:
         st.info("관심종목을 선택하거나 직접 티커를 입력하세요.")
@@ -1373,7 +1387,24 @@ def _render_chart_page(watchlist_rows: list[dict[str, Any]], source: str) -> Non
 
     try:
         with st.spinner(f"{ticker} 완료 일봉과 공식 V2 EOD 기준선을 불러오는 중…"):
-            daily = _load_bars(ticker, source)
+            # The main Momentum Monitor scan already fetched and analyzed active
+            # watchlist symbols. Reuse both so the embedded chart adds no duplicate
+            # download or chronological replay for those symbols.
+            normalized_raw = {
+                str(key).strip().upper(): value
+                for key, value in (raw_by_ticker or {}).items()
+            }
+            precomputed_row = None
+            if isinstance(scan_result, pd.DataFrame) and not scan_result.empty and "ticker" in scan_result.columns:
+                rows_for_ticker = scan_result.loc[
+                    scan_result["ticker"].astype(str).str.strip().str.upper() == ticker
+                ]
+                if not rows_for_ticker.empty:
+                    precomputed_row = rows_for_ticker.iloc[0].to_dict()
+
+            daily = normalized_raw.get(ticker) if precomputed_row is not None else None
+            if daily is None or daily.empty:
+                daily = _load_bars(ticker, source)
             if daily is None or daily.empty:
                 st.warning(f"{ticker} 가격 데이터를 가져오지 못했습니다. 티커와 데이터 공급원을 확인하세요.")
                 return
@@ -1390,11 +1421,15 @@ def _render_chart_page(watchlist_rows: list[dict[str, Any]], source: str) -> Non
                     benchmark_qqq = _load_yfinance_bars("QQQ")
                 except Exception:
                     benchmark_qqq = None
-                try:
-                    benchmark_spy = _load_yfinance_bars("SPY")
-                except Exception:
-                    benchmark_spy = None
-            official = _analyze_cached(ticker, daily, _load_seed_state().get(ticker), benchmark_spy)
+            if precomputed_row is not None:
+                official = precomputed_row
+            else:
+                if source == "Yahoo Finance (EOD)":
+                    try:
+                        benchmark_spy = _load_yfinance_bars("SPY")
+                    except Exception:
+                        benchmark_spy = None
+                official = _analyze_cached(ticker, daily, _load_seed_state().get(ticker), benchmark_spy)
             levels = {
                 "candidate": official.get("candidate_pivot"),
                 "candidate_source": official.get("candidate_pivot_source"),
@@ -2390,9 +2425,6 @@ elif page == "Quality Recovery":
 elif page == "PP Journal":
     _render_pp_journal_page(supabase_client, user_id, symbols, watchlist_rows)
 
-elif page == "Chart":
-    _render_chart_page(watchlist_rows, source)
-
 elif page in {"Momentum Monitor", "Pattern Scanner"}:
     if page == "Momentum Monitor":
         _render_momentum_market_header()
@@ -2405,8 +2437,11 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
         st.caption("Yahoo Finance EOD 정책: 완료된 미국 일봉만 사용합니다. 장중 가격/누적 거래량은 별도 Live Monitor에서 분리해 확인합니다.")
         if page == "Momentum Monitor":
             _render_momentum_market_map(symbols, watchlist_rows)
+            _render_momentum_chart_section(watchlist_rows, source)
     elif not symbols:
         st.warning("활성 관심종목이 없습니다. 화면 왼쪽의 Watchlist에서 종목을 추가하거나 비활성화 여부를 확인하세요.")
+        if page == "Momentum Monitor":
+            _render_momentum_chart_section(watchlist_rows, source)
     else:
         scan_bar = st.progress(0.0, text="스캔 준비 중…")
         scan_status = st.empty()
@@ -2487,6 +2522,7 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
             st.error("분석할 수 있는 종목이 없습니다. 데이터 공급원과 심볼을 확인하세요.")
             if page == "Momentum Monitor":
                 _render_momentum_market_map(symbols, watchlist_rows)
+                _render_momentum_chart_section(watchlist_rows, source)
         else:
             latest_date = result["as_of_date"].max()
             k1, k2, k3, k4 = st.columns(4)
@@ -2514,6 +2550,12 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
                 )
                 if source == "Yahoo Finance (EOD)":
                     _render_technical_confirmation_detail(raw, symbols, as_of_date=latest_date)
+                _render_momentum_chart_section(
+                    watchlist_rows,
+                    source,
+                    scan_result=result,
+                    raw_by_ticker=raw,
+                )
             else:
                 st.subheader("Pattern Scanner")
                 st.caption("종목별 주 패턴과 활성 후보 피봇을 스캔합니다. 진단용 보조 탐지는 활성 피봇을 덮어쓰지 않습니다.")
@@ -2529,7 +2571,7 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
                     filtered = filtered[filtered["stage"].astype(str) == stage_filter]
                 _render_scan_table(filtered, pattern_mode=True)
                 st.caption(f"필터 결과 {len(filtered)} / {len(result)}개 종목")
-            _render_symbol_detail(result, raw)
+                _render_symbol_detail(result, raw)
 
         if errors:
             with st.expander(f"데이터/분석 오류 ({len(errors)})", expanded=bool(errors)):
