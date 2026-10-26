@@ -49,7 +49,7 @@ def replay_symbol(
         bars = bars.loc[eligible].reset_index(drop=True)
         eod_rvol_values = eod_rvol_values.loc[eligible].reset_index(drop=True)
     if bars.empty:
-        return pd.DataFrame(columns=["ticker", "as_of_date", "open", "high", "low", "close", "volume", "eod_rvol", "pattern", "candidate_pivot", "breakout_pivot", "stage", "rebase_active", "rebase_started_at", "rebase_reason", "breakout_event", "breakout_failure", "validation_status"])
+        return pd.DataFrame(columns=["ticker", "as_of_date", "open", "high", "low", "close", "volume", "eod_rvol", "pattern", "candidate_pivot", "breakout_pivot", "stage", "rebase_active", "rebase_started_at", "rebase_reason", "breakout_event", "breakout_confirmed", "breakout_failure", "validation_status"])
 
     candidate_pivot = initial_candidate_pivot
     breakout_pivot = initial_breakout_pivot
@@ -266,6 +266,10 @@ def replay_symbol(
             "rebase_reason": rebase_state.primary_reason,
             "rebase_secondary_reasons": "|".join(rebase_state.secondary_reasons),
             "breakout_event": stage.breakout_event,
+            # Confirmation is an event-day flag, not a persistent state. Keep it
+            # explicit in replay rows so downstream integrations can distinguish a
+            # high-volume upward cross from a later high-volume day without a new cross.
+            "breakout_confirmed": stage.breakout_confirmed,
             "breakout_failure": stage.breakout_failure,
             "prior_candidate_pivot": prior_candidate,
             "prior_breakout_pivot": prior_breakout,
