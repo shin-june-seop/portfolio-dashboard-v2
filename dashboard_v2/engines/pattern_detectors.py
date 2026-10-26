@@ -49,6 +49,61 @@ def _prepare(frame: pd.DataFrame, *, already_validated: bool = False) -> pd.Data
     return frame if already_validated else normalize_ohlcv(frame)
 
 
+def _scan_array(df: pd.DataFrame, column: str) -> np.ndarray:
+    """Reuse column arrays across detectors within one scan of the same bar window."""
+    cache = df.attrs.get("_v2_pattern_arrays")
+    if isinstance(cache, dict) and column in cache:
+        return cache[column]
+    return df[column].to_numpy(float)
+
+
+def _scan_extrema(df: pd.DataFrame, kind: str, order: int) -> np.ndarray:
+    """Reuse extrema points shared by several pattern detectors for a scan window."""
+    key = (kind, order)
+    cache = df.attrs.get("_v2_pattern_extrema")
+    if isinstance(cache, dict) and key in cache:
+        return cache[key]
+    values = _scan_array(df, "High" if kind == "max" else "Low")
+    return np.asarray(_local_extrema(values, kind=kind, order=order), dtype=int)
+
+
+def _prepare_scan_context(df: pd.DataFrame, rebase_started_at: date | str | None) -> None:
+    """Materialize immutable arrays/extrema once for a detector suite invocation."""
+    # DataFrame attrs are private, per-call scratch space. Callers pass a detector
+    # window, not the master OHLCV frame, so these arrays cannot become stale.
+    df.attrs["_v2_pattern_arrays"] = {
+        name: df[name].to_numpy(float)
+        for name in ("High", "Low", "Close", "Volume")
+    }
+    arrays = df.attrs["_v2_pattern_arrays"]
+    df.attrs["_v2_pattern_extrema"] = {
+        ("max", 2): np.asarray(_local_extrema(arrays["High"], kind="max", order=2), dtype=int),
+        ("min", 2): np.asarray(_local_extrema(arrays["Low"], kind="min", order=2), dtype=int),
+        ("min", 3): np.asarray(_local_extrema(arrays["Low"], kind="min", order=3), dtype=int),
+    }
+    if rebase_started_at is not None:
+        rebase_date = pd.Timestamp(rebase_started_at).date()
+        date_values = pd.to_datetime(df["Date"]).to_numpy(dtype="datetime64[ns]")
+        df.attrs["_v2_rebase_start_index"] = int(np.searchsorted(
+            date_values, np.datetime64(rebase_date, "ns"), side="left"
+        ))
+        df.attrs["_v2_rebase_start_date"] = str(rebase_date)
+    else:
+        df.attrs.pop("_v2_rebase_start_index", None)
+        df.attrs.pop("_v2_rebase_start_date", None)
+
+
+def _primary_candidate_is_valid(candidate: PatternCandidate | None) -> bool:
+    """Match pattern_engine's primary-candidate validation without sorting a list."""
+    if candidate is None or not candidate.valid or candidate.candidate_pivot is None:
+        return False
+    try:
+        pivot = float(candidate.candidate_pivot)
+        return isfinite(pivot) and pivot > 0 and candidate.pattern_start_date is not None
+    except (TypeError, ValueError):
+        return False
+
+
 def _segment(df: pd.DataFrame, start: int, end: int) -> pd.DataFrame:
     # Positional indexers keep the original frame index but avoid materializing a reset copy.
     return df.iloc[start:end + 1]
@@ -127,21 +182,24 @@ def _candidate(name: str, df: pd.DataFrame, start_idx: int, end_idx: int, pivot:
     )
 
 
-def _ends(n: int, *, max_age: int = DEFAULT_FORMATION_END_LOOKBACK) -> range:
+def _ends(n: int, *, max_age: int = DEFAULT_FORMATION_END_LOOKBACK,
+          end_index: int | None = None) -> range:
+    if end_index is not None:
+        return range(int(end_index), int(end_index) - 1, -1)
     return range(n - 1, max(-1, n - max_age - 2), -1)
 
 
-def detect_double_bottom(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
+def detect_double_bottom(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False, _end_index: int | None = None) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
     # Materialize each column once. Creating thousands of tiny pandas slices in
     # the chronological replay is expensive and does not change these reductions.
-    highs_all = df["High"].to_numpy(float)
-    lows_all = df["Low"].to_numpy(float)
-    closes_all = df["Close"].to_numpy(float)
-    low_extrema_all = np.asarray(_local_extrema(lows_all, kind="min", order=2), dtype=int)
+    highs_all = _scan_array(df, "High")
+    lows_all = _scan_array(df, "Low")
+    closes_all = _scan_array(df, "Close")
+    low_extrema_all = _scan_extrema(df, "min", 2)
     # Search longer structures first at each recent endpoint.
-    for end in _ends(n):
+    for end in _ends(n, end_index=_end_index):
         for length in range(min(PS.double_bottom_max_bars, end + 1), PS.double_bottom_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
@@ -271,12 +329,12 @@ def _cup_path_quality(high: np.ndarray, low: np.ndarray, shape: dict) -> dict | 
     }
 
 
-def detect_cup_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
+def detect_cup_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False, _end_index: int | None = None) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
-    highs = df["High"].to_numpy(float)
-    lows = df["Low"].to_numpy(float)
-    for end in _ends(n):
+    highs = _scan_array(df, "High")
+    lows = _scan_array(df, "Low")
+    for end in _ends(n, end_index=_end_index):
         # Total duration >=35 bars; cup itself should be >=30 bars, and handle >=5.
         for total_len in range(min(PS.cup_handle_max_total_bars, end + 1), PS.cup_handle_min_total_bars - 1, -1):
             start = end - total_len + 1
@@ -312,12 +370,12 @@ def detect_cup_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | No
     return None
 
 
-def detect_cup_without_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
+def detect_cup_without_handle(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False, _end_index: int | None = None) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
-    highs_all = df["High"].to_numpy(float)
-    lows_all = df["Low"].to_numpy(float)
-    for end in _ends(n):
+    highs_all = _scan_array(df, "High")
+    lows_all = _scan_array(df, "Low")
+    for end in _ends(n, end_index=_end_index):
         for length in range(min(PS.cup_without_handle_max_bars, end + 1), PS.cup_without_handle_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
@@ -358,13 +416,13 @@ def detect_cup_without_handle(frame: pd.DataFrame, *, rebase_started_at: date | 
     return None
 
 
-def detect_flat_base(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
+def detect_flat_base(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False, _end_index: int | None = None) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
-    highs_all = df["High"].to_numpy(float)
-    lows_all = df["Low"].to_numpy(float)
-    closes_all = df["Close"].to_numpy(float)
-    for end in _ends(n):
+    highs_all = _scan_array(df, "High")
+    lows_all = _scan_array(df, "Low")
+    closes_all = _scan_array(df, "Close")
+    for end in _ends(n, end_index=_end_index):
         for length in range(min(PS.flat_base_max_bars, end + 1), PS.flat_base_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
@@ -401,13 +459,13 @@ def detect_flat_base(frame: pd.DataFrame, *, rebase_started_at: date | str | Non
     return None
 
 
-def detect_saucer_base(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
+def detect_saucer_base(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False, _end_index: int | None = None) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
-    highs_all = df["High"].to_numpy(float)
-    lows_all = df["Low"].to_numpy(float)
-    low_extrema_order3 = np.asarray(_local_extrema(lows_all, kind="min", order=3), dtype=int)
-    for end in _ends(n):
+    highs_all = _scan_array(df, "High")
+    lows_all = _scan_array(df, "Low")
+    low_extrema_order3 = _scan_extrema(df, "min", 3)
+    for end in _ends(n, end_index=_end_index):
         for length in range(min(PS.saucer_max_bars, end + 1), PS.saucer_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
@@ -443,14 +501,14 @@ def detect_saucer_base(frame: pd.DataFrame, *, rebase_started_at: date | str | N
     return None
 
 
-def detect_ascending_base(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
+def detect_ascending_base(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False, _end_index: int | None = None) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
-    highs_all = df["High"].to_numpy(float)
-    lows_all = df["Low"].to_numpy(float)
-    high_extrema_all = np.asarray(_local_extrema(highs_all, kind="max", order=2), dtype=int)
-    low_extrema_all = np.asarray(_local_extrema(lows_all, kind="min", order=2), dtype=int)
-    for end in _ends(n):
+    highs_all = _scan_array(df, "High")
+    lows_all = _scan_array(df, "Low")
+    high_extrema_all = _scan_extrema(df, "max", 2)
+    low_extrema_all = _scan_extrema(df, "min", 2)
+    for end in _ends(n, end_index=_end_index):
         for length in range(min(PS.ascending_base_max_bars, end + 1), PS.ascending_base_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
@@ -491,13 +549,13 @@ def detect_ascending_base(frame: pd.DataFrame, *, rebase_started_at: date | str 
     return None
 
 
-def detect_high_tight_flag(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
+def detect_high_tight_flag(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False, _end_index: int | None = None) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
-    highs_all = df["High"].to_numpy(float)
-    lows_all = df["Low"].to_numpy(float)
-    closes_all = df["Close"].to_numpy(float)
-    for end in _ends(n):
+    highs_all = _scan_array(df, "High")
+    lows_all = _scan_array(df, "Low")
+    closes_all = _scan_array(df, "Close")
+    for end in _ends(n, end_index=_end_index):
         for flag_len in range(PS.high_tight_flag_max_bars, PS.high_tight_flag_min_bars - 1, -1):
             flag_start = end - flag_len + 1
             if flag_start < 1:
@@ -533,15 +591,15 @@ def detect_high_tight_flag(frame: pd.DataFrame, *, rebase_started_at: date | str
     return None
 
 
-def detect_vcp(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False) -> PatternCandidate | None:
+def detect_vcp(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None, _normalized: bool = False, _end_index: int | None = None) -> PatternCandidate | None:
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
-    highs_all = df["High"].to_numpy(float)
-    lows_all = df["Low"].to_numpy(float)
-    volumes_all = df["Volume"].to_numpy(float)
-    high_extrema_all = np.asarray(_local_extrema(highs_all, kind="max", order=2), dtype=int)
-    low_extrema_all = np.asarray(_local_extrema(lows_all, kind="min", order=2), dtype=int)
-    for end in _ends(n):
+    highs_all = _scan_array(df, "High")
+    lows_all = _scan_array(df, "Low")
+    volumes_all = _scan_array(df, "Volume")
+    high_extrema_all = _scan_extrema(df, "max", 2)
+    low_extrema_all = _scan_extrema(df, "min", 2)
+    for end in _ends(n, end_index=_end_index):
         for length in range(min(PS.vcp_max_bars, end + 1), PS.vcp_min_bars - 1, -1):
             start = end - length + 1
             if start < 0 or not _valid_after_rebase(df, start, rebase_started_at):
@@ -601,7 +659,7 @@ def detect_vcp(frame: pd.DataFrame, *, rebase_started_at: date | str | None = No
 def detect_base_on_base(frame: pd.DataFrame, *, prior_breakout_pivot: float | None,
                         prior_breakout_date: date | str | None = None,
                         rebase_started_at: date | str | None = None,
-                        _normalized: bool = False) -> PatternCandidate | None:
+                        _normalized: bool = False, _end_index: int | None = None) -> PatternCandidate | None:
     """Detect a second flat-style base above a known first-base breakout pivot.
 
     The prior breakout pivot must be supplied from preserved event state; this
@@ -611,9 +669,9 @@ def detect_base_on_base(frame: pd.DataFrame, *, prior_breakout_pivot: float | No
         return None
     df = _prepare(frame, already_validated=_normalized)
     n = len(df)
-    closes = df["Close"].to_numpy(float)
-    highs = df["High"].to_numpy(float)
-    lows = df["Low"].to_numpy(float)
+    closes = _scan_array(df, "Close")
+    highs = _scan_array(df, "High")
+    lows = _scan_array(df, "Low")
     breakout_idx = None
     if prior_breakout_date is not None:
         event_date = pd.Timestamp(prior_breakout_date).date()
@@ -628,7 +686,7 @@ def detect_base_on_base(frame: pd.DataFrame, *, prior_breakout_pivot: float | No
     if breakout_idx is None:
         return None
 
-    for end in _ends(n):
+    for end in _ends(n, end_index=_end_index):
         # A candidate ending before the first breakout cannot be a second base.
         # Guard this before slicing: highs[breakout_idx:end + 1] is empty when
         # end < breakout_idx, and np.max(empty) raises instead of rejecting it.
@@ -663,37 +721,21 @@ def detect_base_on_base(frame: pd.DataFrame, *, prior_breakout_pivot: float | No
     return None
 
 
-def detect_pattern_candidates(
-    frame: pd.DataFrame,
-    *,
-    rebase_started_at: date | str | None = None,
-    prior_breakout_pivot: float | None = None,
-    prior_breakout_date: date | str | None = None,
-    _normalized: bool = False,
-) -> list[PatternCandidate]:
-    """Run available V2 detector set and return every valid candidate for diagnostics.
-
-    UI consumers must call ``select_primary_pattern`` and display only that one
-    main pattern/pivot. Candidate detector diagnostics are for test/debug only.
-    """
-    # Private replay fast path: chronological_replay already normalized and
-    # date-sorted the complete input, and each detector frame is only a slice of it.
-    df = frame if _normalized else normalize_ohlcv(frame)
-    if df.empty:
-        return []
-    if rebase_started_at is not None:
-        rebase_date = pd.Timestamp(rebase_started_at).date()
-        date_values = pd.to_datetime(df["Date"]).to_numpy(dtype="datetime64[ns]")
-        df.attrs["_v2_rebase_start_index"] = int(np.searchsorted(
-            date_values, np.datetime64(rebase_date, "ns"), side="left"
-        ))
-        df.attrs["_v2_rebase_start_date"] = str(rebase_date)
-    else:
-        # The replay fast path reuses slices of already normalized bars. Ensure an
-        # attribute from a prior day's detector call cannot leak into this scan.
-        df.attrs.pop("_v2_rebase_start_index", None)
-        df.attrs.pop("_v2_rebase_start_date", None)
-    detectors: tuple[Callable[..., PatternCandidate | None], ...] = (
+def _detector_order(*, primary_priority: bool = False):
+    """Return detector order; primary order follows the configured pattern priority."""
+    if primary_priority:
+        return (
+            detect_vcp,
+            detect_high_tight_flag,
+            detect_base_on_base,
+            detect_cup_handle,
+            detect_double_bottom,
+            detect_flat_base,
+            detect_cup_without_handle,
+            detect_saucer_base,
+            detect_ascending_base,
+        )
+    return (
         detect_high_tight_flag,
         detect_vcp,
         detect_base_on_base,
@@ -704,13 +746,38 @@ def detect_pattern_candidates(
         detect_saucer_base,
         detect_ascending_base,
     )
+
+
+def _detector_kwargs(detector, rebase_started_at, prior_breakout_pivot, prior_breakout_date,
+                     end_index: int | None = None):
+    kwargs = {"rebase_started_at": rebase_started_at, "_normalized": True}
+    if end_index is not None:
+        kwargs["_end_index"] = end_index
+    if detector is detect_base_on_base:
+        kwargs["prior_breakout_pivot"] = prior_breakout_pivot
+        kwargs["prior_breakout_date"] = prior_breakout_date
+    return kwargs
+
+
+def detect_pattern_candidates(
+    frame: pd.DataFrame,
+    *,
+    rebase_started_at: date | str | None = None,
+    prior_breakout_pivot: float | None = None,
+    prior_breakout_date: date | str | None = None,
+    _normalized: bool = False,
+) -> list[PatternCandidate]:
+    """Run the full detector suite and return every candidate for diagnostics."""
+    df = frame if _normalized else normalize_ohlcv(frame)
+    if df.empty:
+        return []
+    df = df.copy(deep=False)
+    _prepare_scan_context(df, rebase_started_at)
     found: list[PatternCandidate] = []
-    for detector in detectors:
-        kwargs = {"rebase_started_at": rebase_started_at, "_normalized": True}
-        if detector is detect_base_on_base:
-            kwargs["prior_breakout_pivot"] = prior_breakout_pivot
-            kwargs["prior_breakout_date"] = prior_breakout_date
-        candidate = detector(df, **kwargs)
+    for detector in _detector_order():
+        candidate = detector(df, **_detector_kwargs(
+            detector, rebase_started_at, prior_breakout_pivot, prior_breakout_date
+        ))
         if candidate is not None:
             found.append(candidate)
     return found
@@ -719,10 +786,44 @@ def detect_pattern_candidates(
 def detect_primary_pattern(frame: pd.DataFrame, *, rebase_started_at: date | str | None = None,
                            prior_breakout_pivot: float | None = None,
                            prior_breakout_date: date | str | None = None,
-                           _normalized: bool = False) -> PatternCandidate | None:
-    """Return the single pattern and candidate pivot used by downstream engines."""
-    return select_primary_pattern(detect_pattern_candidates(
-        frame, rebase_started_at=rebase_started_at,
-        prior_breakout_pivot=prior_breakout_pivot,
-        prior_breakout_date=prior_breakout_date, _normalized=_normalized,
-    ))
+                           _normalized: bool = False,
+                           _endpoint_cache: dict | None = None) -> PatternCandidate | None:
+    """Return the same priority-selected candidate, reusing overlapping detector endpoints.
+
+    The original detector contract is priority-first, then newest-to-oldest endpoint
+    (latest bar and the prior two bars). Cache each detector's result for each endpoint
+    and state input. When the 120-bar replay window advances one day, the two prior
+    endpoint results can be reused exactly; only new endpoint/detector pairs need work.
+    """
+    df = frame if _normalized else normalize_ohlcv(frame)
+    if df.empty:
+        return None
+    df = df.copy(deep=False)
+    _prepare_scan_context(df, rebase_started_at)
+    rebase_key = str(pd.Timestamp(rebase_started_at).date()) if rebase_started_at is not None else None
+    breakout_pivot_key = float(prior_breakout_pivot) if prior_breakout_pivot is not None and pd.notna(prior_breakout_pivot) else None
+    breakout_date_key = str(pd.Timestamp(prior_breakout_date).date()) if prior_breakout_date is not None and pd.notna(prior_breakout_date) else None
+    # Priority-first matches select_primary_pattern and avoids spending time on lower
+    # priority detectors as soon as a valid higher-priority pattern is found.
+    for detector in _detector_order(primary_priority=True):
+        for end_index in _ends(len(df)):
+            endpoint_date = pd.Timestamp(df["Date"].iat[end_index]).date().isoformat()
+            # Breakout metadata affects only Base-on-Base detection. Excluding it from
+            # other detector keys preserves reuse across unrelated breakout-state changes.
+            key = (endpoint_date, detector.__name__, rebase_key,
+                   breakout_pivot_key if detector is detect_base_on_base else None,
+                   breakout_date_key if detector is detect_base_on_base else None)
+            if _endpoint_cache is not None and key in _endpoint_cache:
+                candidate = _endpoint_cache[key]
+            else:
+                candidate = detector(df, **_detector_kwargs(
+                    detector, rebase_started_at, prior_breakout_pivot,
+                    prior_breakout_date, end_index=end_index,
+                ))
+                if _endpoint_cache is not None:
+                    _endpoint_cache[key] = candidate
+            if _primary_candidate_is_valid(candidate):
+                return candidate
+    return None
+
+
