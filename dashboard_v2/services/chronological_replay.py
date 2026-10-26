@@ -9,6 +9,7 @@ from datetime import date
 from typing import Callable, Any
 
 import pandas as pd
+from time import perf_counter
 
 from ..engines.data_validation import normalize_ohlcv
 from ..engines.pattern_detectors import detect_primary_pattern
@@ -37,22 +38,57 @@ def replay_symbol(
     Initial state is optional and must come from a real prior snapshot/journal.
     If omitted, the replay does not invent a historical breakout event.
     """
+    replay_started = perf_counter()
+    profile: dict[str, float | int] = {
+        "replay_normalize_seconds": 0.0,
+        "replay_rvol_prepare_seconds": 0.0,
+        "replay_rebase_seconds": 0.0,
+        "replay_pattern_seconds": 0.0,
+        "replay_stage_seconds": 0.0,
+        "replay_loop_seconds": 0.0,
+        "replay_loop_other_seconds": 0.0,
+        "replay_bars_available": 0,
+        "replay_bars_processed": 0,
+        "replay_pattern_cache_entries": 0,
+    }
+
+    def _with_profile(frame: pd.DataFrame) -> pd.DataFrame:
+        measured = dict(profile)
+        measured["replay_total_seconds"] = round(perf_counter() - replay_started, 6)
+        for key, value in tuple(measured.items()):
+            if key.endswith("_seconds"):
+                measured[key] = round(float(value), 6)
+        frame.attrs["performance_profile"] = measured
+        return frame
+
+    normalize_started = perf_counter()
     bars = normalize_ohlcv(raw_frame)
+    profile["replay_normalize_seconds"] += perf_counter() - normalize_started
+    profile["replay_bars_available"] = int(len(bars))
     # Match screening_service's EOD RVOL definition exactly: current completed
     # session volume divided by the mean volume of the prior 20 completed bars,
     # excluding the current bar. Compute before start_date filtering so a resumed
     # or date-scoped replay still has the correct preceding volume context.
+    rvol_prepare_started = perf_counter()
     prior_volume_average = bars["Volume"].rolling(window=20, min_periods=20).mean().shift(1)
     eod_rvol_values = bars["Volume"].divide(prior_volume_average.where(prior_volume_average > 0))
+    profile["replay_rvol_prepare_seconds"] += perf_counter() - rvol_prepare_started
     if start_date is not None:
         eligible = bars["Date"] >= pd.Timestamp(start_date)
         bars = bars.loc[eligible].reset_index(drop=True)
         eod_rvol_values = eod_rvol_values.loc[eligible].reset_index(drop=True)
     if bars.empty:
-        return pd.DataFrame(columns=["ticker", "as_of_date", "open", "high", "low", "close", "volume", "eod_rvol", "pattern", "candidate_pivot", "breakout_pivot", "stage", "rebase_active", "rebase_started_at", "rebase_reason", "breakout_event", "breakout_confirmed", "breakout_failure", "validation_status"])
+        return _with_profile(pd.DataFrame(columns=[
+            "ticker", "as_of_date", "open", "high", "low", "close", "volume", "eod_rvol",
+            "pattern", "pattern_start_date", "pattern_upper", "candidate_pivot", "candidate_pivot_source",
+            "breakout_pivot", "breakout_pivot_source", "next_pivot_candidate", "next_pivot_candidate_source",
+            "stage", "rebase_active", "rebase_started_at", "rebase_reason", "breakout_event",
+            "breakout_confirmed", "breakout_failure", "validation_status",
+        ]))
 
     candidate_pivot = initial_candidate_pivot
     breakout_pivot = initial_breakout_pivot
+    breakout_pivot_source: str | None = None
     breakout_date = pd.Timestamp(initial_breakout_date).date() if initial_breakout_date else None
     breakout_active = bool(initial_breakout_active and breakout_pivot is not None)
     rebase_state = RebaseState(active=False)
@@ -70,6 +106,13 @@ def replay_symbol(
         breakout_pivot = _optional_float(resume_snapshot.get("breakout_pivot"))
         breakout_date = pd.Timestamp(resume_snapshot["breakout_date"]).date() if resume_snapshot.get("breakout_date") and pd.notna(resume_snapshot.get("breakout_date")) else None
         breakout_active = bool(resume_snapshot.get("breakout_cycle_active", False)) and breakout_pivot is not None
+        source_value = resume_snapshot.get("breakout_pivot_source")
+        if source_value is not None and pd.notna(source_value):
+            normalized_source = str(source_value).strip()
+            if normalized_source and normalized_source.upper() not in {
+                "SOURCE_NOT_STORED", "HISTORICAL_SOURCE_NOT_STORED", "NAN", "NONE", "—", "-"
+            }:
+                breakout_pivot_source = normalized_source
         previous_close = _optional_float(resume_snapshot.get("close"))
         started = resume_snapshot.get("rebase_started_at")
         low_date = resume_snapshot.get("rebase_low_date")
@@ -93,6 +136,8 @@ def replay_symbol(
     # replay iterations overlap by two endpoints, so cache endpoint candidates for this
     # one immutable OHLCV replay. Rebase/breakout parameters are part of the cache key.
     pattern_endpoint_cache: dict[tuple, Any] = {}
+    loop_total_seconds = 0.0
+    processed_bars = 0
 
     for idx in range(len(bars)):
         # `bars` was normalized once above. These chronological views are
@@ -102,6 +147,7 @@ def replay_symbol(
         asof = bar["Date"].date()
         if process_cutoff is not None and asof <= process_cutoff:
             continue
+        loop_started = perf_counter()
         close = float(bar["Close"])
         raw_eod_rvol = eod_rvol_values.iloc[idx]
         eod_rvol = float(raw_eod_rvol) if pd.notna(raw_eod_rvol) and float(raw_eod_rvol) >= 0 else None
@@ -115,6 +161,7 @@ def replay_symbol(
         # both unnecessary and a major historical-replay performance penalty.
         trigger_history = history.tail(20)
         rebase_was_active = rebase_state.active
+        rebase_started = perf_counter()
         updated_rebase = update_rebase_state(
             trigger_history, as_of_date=asof, close=close,
             previous_candidate_pivot=prior_candidate,
@@ -124,6 +171,7 @@ def replay_symbol(
             valid_new_pattern=False,
             _normalized=True,
         )
+        profile["replay_rebase_seconds"] += perf_counter() - rebase_started
 
         # Pattern scan is restricted to bars available as of this date. During a
         # rebase, detector structures must begin on/after the fixed cycle start.
@@ -143,6 +191,7 @@ def replay_symbol(
             "prior_breakout_pivot": prior_breakout,
             "prior_breakout_date": detector_breakout_date,
         }
+        pattern_started = perf_counter()
         if pattern_detector is detect_primary_pattern:
             # Only the built-in detector gets the incremental endpoint cache; injected
             # test/custom detectors keep their existing validated call contract.
@@ -153,11 +202,13 @@ def replay_symbol(
             )
         else:
             candidate = pattern_detector(detector_history, **detector_kwargs)
+        profile["replay_pattern_seconds"] += perf_counter() - pattern_started
         valid_candidate = bool(candidate and candidate.valid and candidate.candidate_pivot and candidate.pattern_start_date)
 
         # A valid new-cycle structure ends a rebase only when no fresh trigger is
         # present today; the rebase engine owns that precedence decision.
         if updated_rebase.active and valid_candidate:
+            rebase_started = perf_counter()
             updated_rebase = update_rebase_state(
                 trigger_history, as_of_date=asof, close=close,
                 previous_candidate_pivot=prior_candidate,
@@ -167,22 +218,34 @@ def replay_symbol(
                 valid_new_pattern=True,
                 _normalized=True,
             )
+            profile["replay_rebase_seconds"] += perf_counter() - rebase_started
             # If the cycle ended, this candidate is allowed to become active.
             # If a new trigger kept it active, it remains diagnostic only.
             valid_candidate = not updated_rebase.active
 
         if updated_rebase.active:
             active_candidate_pivot = None
+            active_pattern_upper = None
             pattern_name = "BASE FORMING / NO VALID PATTERN"
             candidate_start = None
-            candidate_source = "REBASE_FORMING"
+            candidate_source = None
         elif valid_candidate:
             active_candidate_pivot = float(candidate.candidate_pivot)
+            active_pattern_upper = (
+                float(candidate.pattern_upper)
+                if candidate.pattern_upper is not None and pd.notna(candidate.pattern_upper)
+                else None
+            )
             pattern_name = candidate.pattern_name
             candidate_start = candidate.pattern_start_date
-            candidate_source = candidate.candidate_pivot_source
+            candidate_source = (
+                str(candidate.candidate_pivot_source).strip()
+                if candidate.candidate_pivot_source is not None and str(candidate.candidate_pivot_source).strip()
+                else None
+            )
         else:
             active_candidate_pivot = None
+            active_pattern_upper = None
             pattern_name = "BASE FORMING / NO VALID PATTERN"
             candidate_start = None
             candidate_source = None
@@ -199,6 +262,7 @@ def replay_symbol(
 
         # Use detector output only when it is valid for the current state. A
         # historical Breakout Pivot is never replaced by a newly scanned pivot.
+        stage_started = perf_counter()
         stage = evaluate_official_stage(StageInput(
             as_of_date=asof,
             close=close,
@@ -213,6 +277,7 @@ def replay_symbol(
             next_pivot_valid=active_candidate_pivot is not None,
             eod_rvol=eod_rvol,
         ))
+        profile["replay_stage_seconds"] += perf_counter() - stage_started
 
         if stage.breakout_failure:
             # Preserve the historical pivot as a record, but close its active cycle.
@@ -222,7 +287,8 @@ def replay_symbol(
             candidate_pivot = None
             pattern_name = "BASE FORMING / NO VALID PATTERN"
             candidate_start = None
-            candidate_source = "REBASE_FORMING"
+            candidate_source = None
+            active_pattern_upper = None
             active_candidate_pivot = None
         else:
             rebase_state = updated_rebase
@@ -231,6 +297,7 @@ def replay_symbol(
                 # The Breakout Pivot changes only on an actual upward cross of a
                 # valid candidate pivot. Until then, keep the last historical value.
                 breakout_pivot = float(stage.activate_breakout_pivot)
+                breakout_pivot_source = candidate_source
                 breakout_date = asof
                 breakout_active = True
             elif updated_rebase.active:
@@ -254,8 +321,25 @@ def replay_symbol(
             "eod_rvol": eod_rvol,
             "pattern": pattern_name,
             "pattern_start_date": candidate_start.isoformat() if candidate_start else None,
+            "pattern_upper": active_pattern_upper if candidate_pivot is not None else None,
             "candidate_pivot": candidate_pivot,
+            "candidate_pivot_source": candidate_source if candidate_pivot is not None else None,
             "breakout_pivot": breakout_pivot,
+            "breakout_pivot_source": breakout_pivot_source if breakout_pivot is not None else None,
+            "next_pivot_candidate": (
+                candidate_pivot
+                if candidate_pivot is not None and (
+                    not breakout_active or breakout_pivot is None or abs(float(candidate_pivot) - float(breakout_pivot)) > 1e-9
+                )
+                else None
+            ),
+            "next_pivot_candidate_source": (
+                candidate_source
+                if candidate_pivot is not None and (
+                    not breakout_active or breakout_pivot is None or abs(float(candidate_pivot) - float(breakout_pivot)) > 1e-9
+                )
+                else None
+            ),
             "breakout_date": breakout_date.isoformat() if breakout_date else None,
             "breakout_cycle_active": breakout_active,
             "stage": stage.stage.value,
@@ -276,5 +360,17 @@ def replay_symbol(
             "validation_status": "OBSERVED_NOT_VALIDATED",
         })
         previous_close = close
+        processed_bars += 1
+        loop_total_seconds += perf_counter() - loop_started
 
-    return pd.DataFrame(rows)
+    profile["replay_loop_seconds"] = loop_total_seconds
+    profile["replay_loop_other_seconds"] = max(
+        0.0,
+        loop_total_seconds
+        - float(profile["replay_rebase_seconds"])
+        - float(profile["replay_pattern_seconds"])
+        - float(profile["replay_stage_seconds"]),
+    )
+    profile["replay_bars_processed"] = processed_bars
+    profile["replay_pattern_cache_entries"] = len(pattern_endpoint_cache)
+    return _with_profile(pd.DataFrame(rows))

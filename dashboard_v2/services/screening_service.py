@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from functools import lru_cache
 import math
+from time import perf_counter
 
 import pandas as pd
 
@@ -96,6 +97,7 @@ def _revalidate_seed_breakout_events(
     *,
     seed_path: Path | str = SEED_REPLAY_PATH,
     attempts: list[dict[str, Any]] | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Revalidate seed breakout dates against current-basis completed OHLC bars.
 
@@ -109,13 +111,21 @@ def _revalidate_seed_breakout_events(
     Optional ``attempts`` captures why an event date was or wasn't revalidated.
     """
     diagnostics = attempts if attempts is not None else []
+    recovery_profile = profile if profile is not None else {}
+    recovery_profile.setdefault("historical_recovery_pattern_seconds", 0.0)
+    recovery_profile.setdefault("historical_recovery_events_considered", 0)
+    recovery_profile.setdefault("historical_recovery_events_revalidated", 0)
+    seed_load_started = perf_counter()
     seed = _load_seed_replay_history(str(Path(seed_path)))
+    recovery_profile["historical_recovery_seed_ledger_load_seconds"] = round(perf_counter() - seed_load_started, 6)
     ticker = str(symbol).upper().strip()
     if seed.empty or bars is None or bars.empty:
         diagnostics.append({"reason": "NO_SEED_LEDGER_OR_BARS"})
         return []
 
+    normalize_started = perf_counter()
     technical = normalize_ohlcv(bars).tail(300).reset_index(drop=True)
+    recovery_profile["historical_recovery_normalize_seconds"] = round(perf_counter() - normalize_started, 6)
     if len(technical) < 2:
         diagnostics.append({"reason": "INSUFFICIENT_TECHNICAL_BARS", "bars": len(technical)})
         return []
@@ -129,6 +139,7 @@ def _revalidate_seed_breakout_events(
     events = events.loc[
         (events["as_of_date"] >= first_date) & (events["as_of_date"] <= last_date)
     ].sort_values("as_of_date")
+    recovery_profile["historical_recovery_events_considered"] = int(len(events))
     if events.empty:
         diagnostics.append({
             "reason": "NO_SEED_BREAKOUT_DATE_IN_ROLLING_WINDOW",
@@ -168,6 +179,7 @@ def _revalidate_seed_breakout_events(
             diagnostics.append(attempt)
             continue
         rebase_start = _historical_rebase_start(seed_symbol, event_date)
+        pattern_started = perf_counter()
         candidates = detect_pattern_candidates(
             prior_bars,
             rebase_started_at=rebase_start,
@@ -175,6 +187,9 @@ def _revalidate_seed_breakout_events(
             prior_breakout_date=prior_validated_date,
         )
         primary = select_primary_pattern(candidates)
+        recovery_profile["historical_recovery_pattern_seconds"] = float(
+            recovery_profile.get("historical_recovery_pattern_seconds", 0.0)
+        ) + (perf_counter() - pattern_started)
         if primary is None:
             attempt["reason"] = "NO_VALID_PRIMARY_PATTERN_ON_PREVIOUS_BAR"
             diagnostics.append(attempt)
@@ -208,6 +223,8 @@ def _revalidate_seed_breakout_events(
             "seed_pattern": seed_pattern or None,
             "seed_pattern_matches_current": attempt["seed_pattern_matches_current"],
             "candidate_pivot": float(pivot),
+            "candidate_pivot_source": primary.candidate_pivot_source,
+            "pattern_upper": _num(primary.pattern_upper),
             "pattern_start_date": (
                 primary.pattern_start_date.isoformat() if primary.pattern_start_date else None
             ),
@@ -215,6 +232,9 @@ def _revalidate_seed_breakout_events(
             "event_close": float(event_close),
         }
         recovered.append(recovered_event)
+        recovery_profile["historical_recovery_events_revalidated"] = int(
+            recovery_profile.get("historical_recovery_events_revalidated", 0)
+        ) + 1
         attempt["reason"] = "SEED_EVENT_REVALIDATED_ON_CURRENT_OHLC"
         diagnostics.append(attempt)
         prior_validated_pivot = float(pivot)
@@ -223,7 +243,8 @@ def _revalidate_seed_breakout_events(
 
 
 def _reconcile_historical_breakout(
-    symbol: str, bars: pd.DataFrame, state: dict[str, Any], provenance: str
+    symbol: str, bars: pd.DataFrame, state: dict[str, Any], provenance: str,
+    *, profile: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Restore last historical breakout metadata only from a current-basis cross.
 
@@ -247,7 +268,7 @@ def _reconcile_historical_breakout(
         return dict(state), diagnostic
 
     attempts: list[dict[str, Any]] = []
-    events = _revalidate_seed_breakout_events(symbol, bars, attempts=attempts)
+    events = _revalidate_seed_breakout_events(symbol, bars, attempts=attempts, profile=profile)
     if not events:
         if attempts:
             latest_attempt = attempts[-1]
@@ -285,6 +306,7 @@ def _reconcile_historical_breakout(
     # Recalculate the numeric pivot from current OHLC; never resurrect the prior
     # active cycle or overwrite the current pattern/rebase state from the ledger.
     reconciled["breakout_pivot"] = float(recovered["candidate_pivot"])
+    reconciled["breakout_pivot_source"] = recovered.get("candidate_pivot_source")
     reconciled["breakout_date"] = recovered_date
     diagnostic.update({
         "historical_breakout_recovered": True,
@@ -384,7 +406,12 @@ def _compatible_seed(bars: pd.DataFrame, seed: dict[str, Any] | None) -> bool:
     return abs(actual_close / seed_close - 1.0) <= 0.005
 
 
-def _history_snapshot(symbol: str, bars: pd.DataFrame, seed: dict[str, Any] | None) -> tuple[dict[str, Any], str]:
+def _history_snapshot(
+    symbol: str, bars: pd.DataFrame, seed: dict[str, Any] | None
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    """Return the official latest state plus timing of the replay/snapshot path."""
+    started = perf_counter()
+
     def _with_recent_history(state: dict[str, Any], history: pd.DataFrame | None) -> dict[str, Any]:
         out = dict(state)
         rows: list[dict[str, Any]] = []
@@ -395,10 +422,18 @@ def _history_snapshot(symbol: str, bars: pd.DataFrame, seed: dict[str, Any] | No
         out["_recent_official_states"] = rows[-5:]
         return out
 
+    def _finish(
+        state: dict[str, Any], provenance: str, replay_profile: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        profile = dict(replay_profile or {})
+        profile["history_snapshot_seconds"] = round(perf_counter() - started, 6)
+        profile["history_replay_invoked"] = bool(replay_profile)
+        return state, provenance, profile
+
     if _compatible_seed(bars, seed):
         seed_date = pd.Timestamp(seed["as_of_date"]).normalize()
         if bars["Date"].max() <= seed_date:
-            return _with_recent_history(dict(seed), None), "BUNDLED_REPLAY_SNAPSHOT"
+            return _finish(_with_recent_history(dict(seed), None), "BUNDLED_REPLAY_SNAPSHOT")
         replay = replay_symbol(symbol, bars, resume_snapshot=seed, process_from_date=seed_date)
         if not replay.empty:
             history_rows: list[dict[str, Any]] = []
@@ -407,17 +442,17 @@ def _history_snapshot(symbol: str, bars: pd.DataFrame, seed: dict[str, Any] | No
             history_rows.extend(replay[["as_of_date", "stage"]].to_dict("records"))
             latest = replay.iloc[-1].to_dict()
             latest["_recent_official_states"] = history_rows[-5:]
-            return latest, "INCREMENTAL_FROM_BUNDLED_SNAPSHOT"
-        return _with_recent_history(dict(seed), None), "BUNDLED_REPLAY_SNAPSHOT"
+            return _finish(latest, "INCREMENTAL_FROM_BUNDLED_SNAPSHOT", replay.attrs.get("performance_profile"))
+        return _finish(_with_recent_history(dict(seed), None), "BUNDLED_REPLAY_SNAPSHOT")
 
     # Use the canonical rolling window used by the V2 chronological engine.
     rolling = bars.tail(300).reset_index(drop=True)
     replay = replay_symbol(symbol, rolling)
     if replay.empty:
-        return {}, "NO_REPLAY_RESULT"
+        return _finish({}, "NO_REPLAY_RESULT", replay.attrs.get("performance_profile"))
     latest = replay.iloc[-1].to_dict()
     latest["_recent_official_states"] = replay[["as_of_date", "stage"]].tail(5).to_dict("records")
-    return latest, "ROLLING_300_BAR_REPLAY"
+    return _finish(latest, "ROLLING_300_BAR_REPLAY", replay.attrs.get("performance_profile"))
 
 
 def analyze_symbol(
@@ -428,18 +463,31 @@ def analyze_symbol(
     benchmark_bars: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """Produce the one canonical row shared by the Momentum and Pattern screens."""
+    analyze_started = perf_counter()
     ticker = symbol.upper().strip()
+    normalization_started = perf_counter()
     bars = normalize_ohlcv(raw_bars)
+    normalization_seconds = perf_counter() - normalization_started
     if bars.empty:
         raise ValueError(f"No daily bars available for {ticker}")
     # The current Yahoo policy supplies split-normalized OHLC plus a separate
     # adjusted close. Do not resume a state snapshot built on dividend-adjusted
     # OHLC; use the transparent 300-bar replay instead to avoid mixed price bases.
     has_separate_adjusted_close = _adjusted_close_column(raw_bars) is not None
+    return_basis_started = perf_counter()
     return_close, return_price_basis = _aligned_return_close(raw_bars, bars)
-    state, provenance = _history_snapshot(
+    return_basis_seconds = perf_counter() - return_basis_started
+    state, provenance, replay_profile = _history_snapshot(
         ticker, bars, None if has_separate_adjusted_close else seed_snapshot
     )
+    recovery_started = perf_counter()
+    historical_recovery_profile: dict[str, Any] = {
+        "historical_recovery_seed_ledger_load_seconds": 0.0,
+        "historical_recovery_normalize_seconds": 0.0,
+        "historical_recovery_pattern_seconds": 0.0,
+        "historical_recovery_events_considered": 0,
+        "historical_recovery_events_revalidated": 0,
+    }
     recovery_diagnostic = {
         "historical_breakout_recovered": False,
         "historical_breakout_recovery_pattern": None,
@@ -448,8 +496,10 @@ def analyze_symbol(
     }
     if has_separate_adjusted_close and provenance == "ROLLING_300_BAR_REPLAY":
         state, recovery_diagnostic = _reconcile_historical_breakout(
-            ticker, bars, dict(state), provenance
+            ticker, bars, dict(state), provenance, profile=historical_recovery_profile
         )
+    recovery_seconds = perf_counter() - recovery_started
+    derived_metrics_started = perf_counter()
     last = bars.iloc[-1]
     previous = bars.iloc[-2] if len(bars) > 1 else None
     close = float(last["Close"])
@@ -489,6 +539,8 @@ def analyze_symbol(
             bench_return = merged["AdjustedCloseBenchmark"].iloc[-1] / merged["AdjustedCloseBenchmark"].iloc[-64] - 1
             rs_63 = (sym_return - bench_return) * 100
 
+    derived_metrics_seconds = perf_counter() - derived_metrics_started
+
     # The primary pattern/pivot is always the one chosen by the chronological
     # engine. Re-scan the latest bars only to expose secondary detector diagnostics.
     # This scan never replaces the active candidate pivot.
@@ -506,6 +558,7 @@ def analyze_symbol(
                 diagnostic_breakout_date = None
         except (TypeError, ValueError):
             diagnostic_breakout_date = None
+    diagnostic_pattern_started = perf_counter()
     secondary = detect_pattern_candidates(
         diagnostic_bars,
         rebase_started_at=rebase_start if bool(state.get("rebase_active", False)) else None,
@@ -513,6 +566,7 @@ def analyze_symbol(
         prior_breakout_date=diagnostic_breakout_date,
     )
     primary = select_primary_pattern(secondary)
+    diagnostic_pattern_seconds = perf_counter() - diagnostic_pattern_started
     current_pattern = str(state.get("pattern") or "BASE FORMING / NO VALID PATTERN")
     # If the replay snapshot predates today's bars, use the current scan for a
     # diagnostic only when no rebase is active; the official pivot is not silently
@@ -529,7 +583,58 @@ def analyze_symbol(
 
     # Pocket Pivot is informational; stage and candidate pivot remain owned by replay.
     constructive = bool(primary) or (sma[50] is not None and sma[200] is not None and close > sma[50] and sma[50] >= sma[200])
+    pocket_pivot_started = perf_counter()
     pp = detect_pocket_pivot(bars, constructive_context=constructive)
+    pocket_pivot_seconds = perf_counter() - pocket_pivot_started
+
+    def _stored_source(value: Any) -> str | None:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).strip()
+        if text.upper() in {
+            "", "NAN", "NONE", "NULL", "—", "-", "SOURCE_NOT_STORED", "HISTORICAL_SOURCE_NOT_STORED"
+        }:
+            return None
+        return text
+
+    candidate_source = _stored_source(state.get("candidate_pivot_source")) if candidate_pivot is not None else None
+    breakout_source = _stored_source(state.get("breakout_pivot_source")) if breakout_pivot is not None else None
+    next_pivot = _num(state.get("next_pivot_candidate"))
+    next_source = _stored_source(state.get("next_pivot_candidate_source")) if next_pivot is not None else None
+    source_diagnostics = []
+    for field, price, source_value in (
+        ("candidate_pivot_source", candidate_pivot, candidate_source),
+        ("breakout_pivot_source", breakout_pivot, breakout_source),
+        ("next_pivot_candidate_source", next_pivot, next_source),
+    ):
+        if price is not None and source_value is None:
+            source_diagnostics.append({
+                "field": field,
+                "reason": "PRICE_PRESENT_SOURCE_MISSING",
+                "price": float(price),
+            })
+
+    analyze_total_seconds = perf_counter() - analyze_started
+    top_level_measured = (
+        normalization_seconds + return_basis_seconds + float(replay_profile.get("history_snapshot_seconds", 0.0))
+        + recovery_seconds + derived_metrics_seconds + diagnostic_pattern_seconds + pocket_pivot_seconds
+    )
+    performance_profile = {
+        "analyze_total_seconds": round(analyze_total_seconds, 6),
+        "normalize_seconds": round(normalization_seconds, 6),
+        "return_basis_seconds": round(return_basis_seconds, 6),
+        "history_snapshot_seconds": round(float(replay_profile.get("history_snapshot_seconds", 0.0)), 6),
+        "recovery_seconds": round(recovery_seconds, 6),
+        "derived_metrics_seconds": round(derived_metrics_seconds, 6),
+        "diagnostic_pattern_seconds": round(diagnostic_pattern_seconds, 6),
+        "pocket_pivot_seconds": round(pocket_pivot_seconds, 6),
+        "unclassified_analyze_seconds": round(max(0.0, analyze_total_seconds - top_level_measured), 6),
+        **{
+            key: (round(float(value), 6) if key.endswith("_seconds") else value)
+            for key, value in historical_recovery_profile.items()
+        },
+        **{key: value for key, value in replay_profile.items() if key.startswith("replay_")},
+    }
     return {
         "ticker": ticker,
         "as_of_date": pd.Timestamp(last["Date"]).date().isoformat(),
@@ -541,13 +646,15 @@ def analyze_symbol(
         "detected_pattern_diagnostic": detected_pattern,
         "pattern_start_date": _date_string(state.get("pattern_start_date")),
         "candidate_pivot": candidate_pivot,
-        "candidate_pivot_source": (str(state.get("candidate_pivot_source") or ("REBASE_FORMING" if bool(state.get("rebase_active", False)) else "SOURCE_NOT_STORED")) if candidate_pivot is not None or bool(state.get("rebase_active", False)) else None),
+        "candidate_pivot_source": candidate_source,
         "candidate_distance_pct": _pct(candidate_distance),
-        "pattern_upper": candidate_pivot,
+        "pattern_upper": _num(state.get("pattern_upper")),
         "breakout_pivot": breakout_pivot,
-        "breakout_pivot_source": (str(state.get("breakout_pivot_source") or "HISTORICAL_SOURCE_NOT_STORED") if breakout_pivot is not None else None),
-        "next_pivot_candidate": _num(state.get("next_pivot_candidate")),
-        "next_pivot_candidate_source": state.get("next_pivot_candidate_source"),
+        "breakout_pivot_source": breakout_source,
+        "next_pivot_candidate": next_pivot,
+        "next_pivot_candidate_source": next_source,
+        "pivot_source_diagnostics": source_diagnostics,
+        "performance_profile": performance_profile,
         "breakout_distance_pct": _pct(breakout_distance),
         "twenty_day_reference": twenty_ref,
         "twenty_day_distance_pct": _pct(twenty_distance),
