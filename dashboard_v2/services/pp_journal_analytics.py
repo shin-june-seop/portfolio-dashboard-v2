@@ -164,11 +164,19 @@ def summarize_trades(trade_summaries: Sequence[Mapping[str, Any]]) -> dict[str, 
 
 
 def analyze_pp_signal_outcome(signal: Mapping[str, Any], raw_bars: pd.DataFrame) -> dict[str, Any]:
-    """Measure forward EOD price excursion; does not claim official breakout/failure events."""
+    """Measure forward EOD price observations, not official StageEngine events.
+
+    Bars dated on or before the saved signal date are excluded to avoid look-ahead.
+    """
     result = {
         "ticker": str(signal.get("ticker", "")),
         "signal_date": _day(signal.get("signal_date")),
         "candidate_pivot_touched": None,
+        "reference_pivot_reached": None,
+        "breakout_reached": None,
+        "breakout_failure_reached": None,
+        "breakout_failure_date": None,
+        "hit_plus_5_pct": None,
         "hit_plus_10_pct": None,
         "hit_plus_20_pct": None,
         "mfe_pct": None,
@@ -181,7 +189,16 @@ def analyze_pp_signal_outcome(signal: Mapping[str, Any], raw_bars: pd.DataFrame)
         return result
     frame = raw_bars.copy()
     dates = pd.to_datetime(frame["Date"], errors="coerce")
-    frame = frame.loc[dates.dt.date > date.fromisoformat(result["signal_date"])].copy()
+    # Normalize timezone to the US market's local session date if provider data is tz-aware.
+    try:
+        if getattr(dates.dt, "tz", None) is not None:
+            dates = dates.dt.tz_convert("America/New_York").dt.tz_localize(None)
+    except (AttributeError, TypeError):
+        pass
+    signal_day = date.fromisoformat(result["signal_date"])
+    frame["_outcome_date"] = dates.dt.date
+    frame = frame.loc[frame["_outcome_date"].notna() & (frame["_outcome_date"] > signal_day)].copy()
+    frame = frame.sort_values("_outcome_date", kind="stable")
     if frame.empty:
         return result
     for column in ("High", "Low"):
@@ -189,20 +206,28 @@ def analyze_pp_signal_outcome(signal: Mapping[str, Any], raw_bars: pd.DataFrame)
             result["outcome_status"] = "DATA_INCOMPLETE"
             return result
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    if frame[["High", "Low"]].isna().any().any() or not frame[["High", "Low"]].apply(lambda col: col.map(math.isfinite)).all().all():
+    required = frame[["High", "Low"]]
+    if required.isna().any().any() or not required.apply(lambda col: col.map(math.isfinite)).all().all():
         result["outcome_status"] = "DATA_INCOMPLETE"
         return result
     price = _num(signal.get("signal_price"))
     if price is None or price <= 0:
         result["outcome_status"] = "DATA_INCOMPLETE"
         return result
+
     highest = float(frame["High"].max())
     lowest = float(frame["Low"].min())
     mfe = (highest / price - 1.0) * 100.0
     mae = (lowest / price - 1.0) * 100.0
-    pivot = _num(signal.get("candidate_pivot"))
+    candidate_pivot = _num(signal.get("candidate_pivot"))
+    reference_pivot = _num(signal.get("breakout_pivot"))
+    if reference_pivot is None or reference_pivot <= 0:
+        reference_pivot = candidate_pivot
+
     result.update({
-        "candidate_pivot_touched": (highest >= pivot) if pivot is not None else None,
+        "candidate_pivot_touched": (highest >= candidate_pivot) if candidate_pivot is not None and candidate_pivot > 0 else None,
+        "reference_pivot_reached": (highest >= reference_pivot) if reference_pivot is not None and reference_pivot > 0 else None,
+        "hit_plus_5_pct": highest >= price * 1.05,
         "hit_plus_10_pct": highest >= price * 1.10,
         "hit_plus_20_pct": highest >= price * 1.20,
         "mfe_pct": mfe,
@@ -210,4 +235,22 @@ def analyze_pp_signal_outcome(signal: Mapping[str, Any], raw_bars: pd.DataFrame)
         "observed_bars": len(frame),
         "outcome_status": "OBSERVED_PRICE_EXCURSION",
     })
+
+    # Price-observed close cross: first future EOD close at/above the saved reference pivot.
+    # Failure is a later close 2% or more below that same stored pivot after a close breakout.
+    if reference_pivot is not None and reference_pivot > 0 and "Close" in frame:
+        closes = pd.to_numeric(frame["Close"], errors="coerce")
+        finite_close_mask = closes.map(lambda value: pd.notna(value) and math.isfinite(float(value)))
+        if finite_close_mask.all():
+            close_values = closes.to_numpy(dtype=float)
+            breakout_positions = [i for i, close in enumerate(close_values) if close >= reference_pivot]
+            result["breakout_reached"] = bool(breakout_positions)
+            result["breakout_failure_reached"] = False
+            if breakout_positions:
+                first_breakout = breakout_positions[0]
+                for pos in range(first_breakout + 1, len(close_values)):
+                    if close_values[pos] <= reference_pivot * 0.98:
+                        result["breakout_failure_reached"] = True
+                        result["breakout_failure_date"] = frame.iloc[pos]["_outcome_date"].isoformat()
+                        break
     return result

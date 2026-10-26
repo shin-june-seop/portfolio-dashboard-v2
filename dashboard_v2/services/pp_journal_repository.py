@@ -60,6 +60,40 @@ def _optional_positive_number(value: Any, field: str) -> float | None:
     return _positive_number(value, field)
 
 
+def _optional_finite_number(value: Any, field: str) -> float | None:
+    """Optional finite numeric snapshot value; missing analytics never blocks a signal."""
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PPJournalValidationError(f"{field}은(는) 숫자로 입력해 주세요.") from exc
+    if not math.isfinite(number):
+        raise PPJournalValidationError(f"{field}은(는) 유한한 숫자여야 합니다.")
+    return number
+
+
+def _snapshot_metrics(row: Mapping[str, Any]) -> dict[str, Any]:
+    rs = _optional_finite_number(row.get("rs_rating"), "RS")
+    momentum = _optional_finite_number(row.get("momentum_score"), "Momentum")
+    pivot_dist = _optional_finite_number(row.get("pivot_dist_pct"), "Pivot 거리")
+    if rs is not None and not 0 <= rs <= 100:
+        raise PPJournalValidationError("RS는 0~100 범위여야 합니다.")
+    if momentum is not None and not 0 <= momentum <= 100:
+        raise PPJournalValidationError("Momentum은 0~100 범위여야 합니다.")
+    quality = str(row.get("pp_quality") or "").strip().upper() or None
+    if quality is not None and quality not in {"A", "B", "C"}:
+        raise PPJournalValidationError("PP Quality는 A/B/C 중 하나여야 합니다.")
+    market_regime = _text(row.get("market_regime"), "Market Regime", 100) or None
+    return {
+        "rs_rating": rs,
+        "momentum_score": momentum,
+        "pp_quality": quality,
+        "market_regime": market_regime,
+        "pivot_dist_pct": pivot_dist,
+    }
+
+
 def _nonnegative_number(value: Any, field: str) -> float:
     try:
         number = float(value)
@@ -105,6 +139,7 @@ def normalize_pp_signal(row: Mapping[str, Any], *, user_id: str) -> dict[str, An
     context_valid = bool(row.get("context_valid", True))
     if not context_valid:
         raise PPJournalValidationError("건설적 추세/베이스 문맥을 통과하지 못한 PP는 저장할 수 없습니다.")
+    snapshot_metrics = _snapshot_metrics(row)
     return {
         "user_id": str(user_id),
         "ticker": ticker,
@@ -119,6 +154,7 @@ def normalize_pp_signal(row: Mapping[str, Any], *, user_id: str) -> dict[str, An
         "breakout_pivot": breakout,
         "context_valid": bool(row.get("context_valid", True)),
         "reason_codes": list(row.get("reason_codes") or ["POCKET_PIVOT_VALID"]),
+        **snapshot_metrics,
     }
 
 
@@ -153,7 +189,21 @@ def save_pp_signals(client: Any, user_id: str, signals: Sequence[Mapping[str, An
 
     missing = [row for row in normalized if (row["ticker"], row["signal_date"]) not in existing_keys]
     if missing:
-        response = client.table(PP_SIGNALS_TABLE).insert(missing).execute()
+        try:
+            response = client.table(PP_SIGNALS_TABLE).insert(missing).execute()
+        except Exception as exc:
+            message = str(exc).lower()
+            snapshot_columns = ("rs_rating", "momentum_score", "pp_quality", "market_regime", "pivot_dist_pct")
+            is_snapshot_schema_mismatch = "schema cache" in message or "does not exist" in message or (
+                "column" in message and any(column in message for column in snapshot_columns)
+            )
+            if not is_snapshot_schema_mismatch:
+                raise
+            legacy_missing = [
+                {key: value for key, value in row.items() if key not in snapshot_columns}
+                for row in missing
+            ]
+            response = client.table(PP_SIGNALS_TABLE).insert(legacy_missing).execute()
         returned = getattr(response, "data", None)
         inserted = len(returned) if returned is not None else len(missing)
     else:
@@ -164,19 +214,39 @@ def save_pp_signals(client: Any, user_id: str, signals: Sequence[Mapping[str, An
 def list_pp_signals(client: Any, user_id: str, *, limit: int = 500) -> list[dict[str, Any]]:
     if not 1 <= int(limit) <= 5000:
         raise ValueError("limit must be between 1 and 5000")
-    response = (
-        client.table(PP_SIGNALS_TABLE)
-        .select(
-            "id,user_id,ticker,signal_date,signal_price,signal_volume,max_prior_down_day_volume,"
-            "reference_ma,pattern_name,entry_stage,candidate_pivot,breakout_pivot,context_valid,reason_codes,created_at"
-        )
-        .eq("user_id", str(user_id))
-        .order("signal_date", desc=True)
-        .order("ticker")
-        .limit(int(limit))
-        .execute()
+    base_columns = (
+        "id,user_id,ticker,signal_date,signal_price,signal_volume,max_prior_down_day_volume,"
+        "reference_ma,pattern_name,entry_stage,candidate_pivot,breakout_pivot,context_valid,reason_codes,created_at"
     )
-    return [dict(row) for row in (getattr(response, "data", None) or [])]
+    try:
+        response = (
+            client.table(PP_SIGNALS_TABLE)
+            .select(base_columns + ",rs_rating,momentum_score,pp_quality,market_regime,pivot_dist_pct")
+            .eq("user_id", str(user_id))
+            .order("signal_date", desc=True)
+            .order("ticker")
+            .limit(int(limit))
+            .execute()
+        )
+        rows = [dict(row) for row in (getattr(response, "data", None) or [])]
+    except Exception as exc:
+        message = str(exc).lower()
+        snapshot_columns = ("rs_rating", "momentum_score", "pp_quality", "market_regime", "pivot_dist_pct")
+        if not ("schema cache" in message or "does not exist" in message or ("column" in message and any(col in message for col in snapshot_columns))):
+            raise
+        response = (
+            client.table(PP_SIGNALS_TABLE)
+            .select(base_columns)
+            .eq("user_id", str(user_id))
+            .order("signal_date", desc=True)
+            .order("ticker")
+            .limit(int(limit))
+            .execute()
+        )
+        rows = [dict(row) for row in (getattr(response, "data", None) or [])]
+        for row in rows:
+            row.update({"rs_rating": None, "momentum_score": None, "pp_quality": None, "market_regime": None, "pivot_dist_pct": None})
+    return rows
 
 
 def _normalize_entry(
