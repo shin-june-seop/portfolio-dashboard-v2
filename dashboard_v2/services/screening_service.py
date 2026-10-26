@@ -477,9 +477,22 @@ def analyze_symbol(
     return_basis_started = perf_counter()
     return_close, return_price_basis = _aligned_return_close(raw_bars, bars)
     return_basis_seconds = perf_counter() - return_basis_started
-    state, provenance, replay_profile = _history_snapshot(
+    history_snapshot_result = _history_snapshot(
         ticker, bars, None if has_separate_adjusted_close else seed_snapshot
     )
+    # Backward compatibility: older callers/tests may still provide the original
+    # two-item (state, provenance) result. The third item was added for profiling,
+    # so absence of it must not break historical recovery or state analysis.
+    if len(history_snapshot_result) == 2:
+        state, provenance = history_snapshot_result
+        replay_profile: dict[str, Any] = {}
+    elif len(history_snapshot_result) == 3:
+        state, provenance, replay_profile = history_snapshot_result
+    else:
+        raise ValueError(
+            "_history_snapshot must return (state, provenance) or "
+            "(state, provenance, replay_profile)"
+        )
     recovery_started = perf_counter()
     historical_recovery_profile: dict[str, Any] = {
         "historical_recovery_seed_ledger_load_seconds": 0.0,
