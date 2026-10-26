@@ -8,7 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -95,10 +95,26 @@ PAGES = [
 st.set_page_config(page_title="Portfolio Dashboard V2", page_icon="📊", layout="wide")
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def _load_yfinance_bars(symbol: str) -> pd.DataFrame:
+def _current_eod_cache_bucket() -> str:
+    """Separate pre-close and completed-session EOD cache entries."""
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    # The provider excludes today's bar before the regular session is completed.
+    # A bucket change after 16:15 ET allows the completed daily bar to be fetched
+    # even if the app was first opened earlier in the day.
+    phase = "PRE_CLOSE" if now_et.time().replace(tzinfo=None) < pd.Timestamp("16:15").time() else "POST_CLOSE"
+    return f"{now_et.date().isoformat()}:{phase}"
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _load_yfinance_bars_cached(symbol: str, cache_bucket: str) -> pd.DataFrame:
+    """Cached daily bars, keyed by exchange date/session phase to avoid stale EOD."""
     from dashboard_v2.services.yfinance_provider import YFinanceDailyProvider
     return YFinanceDailyProvider(history_days=5 * 365).daily_bars(symbol)
+
+
+def _load_yfinance_bars(symbol: str) -> pd.DataFrame:
+    """Reuse daily bars for an hour without reusing a pre-close snapshot after close."""
+    return _load_yfinance_bars_cached(str(symbol).upper().strip(), _current_eod_cache_bucket())
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
@@ -156,7 +172,7 @@ def _load_seed_state() -> dict:
     return load_seed_snapshots()
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=60 * 60, show_spinner=False)
 def _analyze_cached(symbol: str, bars: pd.DataFrame, seed_snapshot: dict | None, benchmark: pd.DataFrame | None) -> dict:
     return analyze_symbol(symbol, bars, seed_snapshot=seed_snapshot, benchmark_bars=benchmark)
 
@@ -169,39 +185,91 @@ def _load_bars(symbol: str, source: str) -> pd.DataFrame:
     raise RuntimeError("Select a data source to load market data")
 
 
-def _run_scan(symbols: list[str], source: str) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[tuple[str, str]], float]:
+def _run_scan(
+    symbols: list[str],
+    source: str,
+    *,
+    progress_callback: Callable[[str, int, int, str], None] | None = None,
+) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[tuple[str, str]], float]:
+    """Fetch bars concurrently, then run independent per-symbol EOD replays concurrently.
+
+    The chronological replay for each symbol remains sequential and authoritative;
+    only independent symbols are scheduled in parallel. Results are restored to the
+    caller's watchlist order so the UI is stable regardless of completion order.
+    """
     start = time.perf_counter()
     seed = _load_seed_state()
-    raw: dict[str, pd.DataFrame] = {}
+    requested = list(dict.fromkeys(str(s).upper().strip() for s in symbols if str(s).strip()))
     errors: list[tuple[str, str]] = []
-    for symbol in symbols:
-        try:
-            raw[symbol] = _load_bars(symbol, source)
-        except Exception as exc:
-            errors.append((symbol, f"{type(exc).__name__}: {exc}"))
+    fetched: dict[str, pd.DataFrame] = {}
+    download_symbols = list(requested)
+    if source == "Yahoo Finance (EOD)" and "SPY" not in download_symbols:
+        download_symbols.append("SPY")
+    download_total = len(download_symbols)
 
-    benchmark = None
-    if source == "Yahoo Finance (EOD)":
+    def notify(stage: str, done: int, total: int, symbol: str) -> None:
+        if progress_callback is None:
+            return
         try:
-            benchmark = _load_yfinance_bars("SPY")
-        except Exception as exc:
-            errors.append(("SPY benchmark", f"{type(exc).__name__}: {exc}"))
+            progress_callback(stage, done, total, symbol)
+        except Exception:
+            # UI progress must never affect data acquisition or engine output.
+            pass
 
-    rows = []
-    for symbol, bars in raw.items():
-        try:
-            rows.append(_analyze_cached(symbol, bars, seed.get(symbol), benchmark))
-        except Exception as exc:
-            errors.append((symbol, f"Analysis {type(exc).__name__}: {exc}"))
+    # Yahoo/network latency is the main first-run bottleneck. Bounded concurrency
+    # avoids serial 15-second waits while not launching one thread per watchlist item.
+    notify("download", 0, max(1, download_total), "시작")
+    if download_symbols:
+        workers = min(6, len(download_symbols))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v2-eod-fetch") as pool:
+            futures = {pool.submit(_load_bars, ticker, source): ticker for ticker in download_symbols}
+            completed = 0
+            for future in as_completed(futures):
+                ticker = futures[future]
+                completed += 1
+                try:
+                    bars = future.result()
+                    if isinstance(bars, pd.DataFrame) and not bars.empty:
+                        fetched[ticker] = bars
+                    elif ticker in requested:
+                        errors.append((ticker, "NO_DAILY_BARS"))
+                    elif ticker == "SPY":
+                        errors.append(("SPY benchmark", "NO_DAILY_BARS"))
+                except Exception as exc:
+                    label = "SPY benchmark" if ticker == "SPY" and ticker not in requested else ticker
+                    errors.append((label, f"{type(exc).__name__}: {exc}"))
+                notify("download", completed, download_total, ticker)
+
+    raw = {ticker: fetched[ticker] for ticker in requested if ticker in fetched}
+    benchmark = fetched.get("SPY") if source == "Yahoo Finance (EOD)" else None
+
+    # Replay is sequential within each ticker, parallel only across independent tickers.
+    rows_by_symbol: dict[str, dict[str, Any]] = {}
+    if raw:
+        notify("analysis", 0, len(raw), "시작")
+        with ThreadPoolExecutor(max_workers=min(4, len(raw)), thread_name_prefix="v2-eod-engine") as pool:
+            futures = {
+                pool.submit(_analyze_cached, ticker, bars, seed.get(ticker), benchmark): ticker
+                for ticker, bars in raw.items()
+            }
+            completed = 0
+            for future in as_completed(futures):
+                ticker = futures[future]
+                completed += 1
+                try:
+                    rows_by_symbol[ticker] = future.result()
+                except Exception as exc:
+                    errors.append((ticker, f"Analysis {type(exc).__name__}: {exc}"))
+                notify("analysis", completed, len(raw), ticker)
+
+    rows = [rows_by_symbol[ticker] for ticker in requested if ticker in rows_by_symbol]
     elapsed = time.perf_counter() - start
     return pd.DataFrame(rows), raw, errors, elapsed
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
 def _load_market_regime_bars(symbol: str) -> pd.DataFrame:
-    """Load complete daily market bars for broad-market regime only."""
-    from dashboard_v2.services.yfinance_provider import YFinanceDailyProvider
-    return YFinanceDailyProvider(history_days=5 * 365).daily_bars(symbol)
+    """Share the same date/session-keyed EOD cache used by screeners and charts."""
+    return _load_yfinance_bars(symbol)
 
 
 
@@ -350,21 +418,30 @@ def _load_market_constituent_tickers() -> tuple[str, ...]:
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def _load_broad_breadth_closes(anchor_date: str, tickers: tuple[str, ...]) -> pd.DataFrame:
-    """Download adjusted closes for index breadth in cached, resilient chunks."""
+    """Download adjusted closes in parallel chunks, cached by completed EOD date.
+
+    450 calendar days usually provide >300 US sessions: enough for the existing
+    252-session momentum/rank formula while reducing transfer size versus 820 days.
+    This changes neither the universe nor its ranking math; a strict 253-row/date
+    validation remains downstream.
+    """
     import yfinance as yf
     if not tickers:
         return pd.DataFrame()
     anchor = pd.Timestamp(anchor_date).date()
-    start = (pd.Timestamp(anchor) - pd.Timedelta(days=820)).date().isoformat()
-    end = (pd.Timestamp(anchor) + pd.Timedelta(days=1)).date().isoformat()
-    frames = []
-    for start_i in range(0, len(tickers), 40):
-        chunk = list(tickers[start_i:start_i + 40])
+    start_date = (pd.Timestamp(anchor) - pd.Timedelta(days=450)).date().isoformat()
+    end_date = (pd.Timestamp(anchor) + pd.Timedelta(days=1)).date().isoformat()
+    chunks = [(i, list(tickers[i:i + 40])) for i in range(0, len(tickers), 40)]
+
+    def fetch_chunk(chunk_record):
+        chunk_index, chunk = chunk_record
         try:
-            data = yf.download(chunk, start=start, end=end, interval="1d", auto_adjust=True,
-                               progress=False, threads=False, group_by="column")
+            data = yf.download(
+                chunk, start=start_date, end=end_date, interval="1d", auto_adjust=True,
+                progress=False, threads=False, group_by="column", timeout=15,
+            )
             if data is None or data.empty:
-                continue
+                return chunk_index, None
             if isinstance(data.columns, pd.MultiIndex):
                 level0 = [str(x) for x in data.columns.get_level_values(0)]
                 level1 = [str(x) for x in data.columns.get_level_values(1)]
@@ -373,12 +450,12 @@ def _load_broad_breadth_closes(anchor_date: str, tickers: tuple[str, ...]) -> pd
                 elif "Close" in level1:
                     closes = data.xs("Close", axis=1, level=1).copy()
                 else:
-                    continue
+                    return chunk_index, None
             elif "Close" in data.columns and len(chunk) == 1:
                 closes = data[["Close"]].copy()
                 closes.columns = [chunk[0]]
             else:
-                continue
+                return chunk_index, None
             idx = pd.to_datetime(closes.index, errors="coerce")
             if getattr(idx, "tz", None) is not None:
                 idx = idx.tz_convert("America/New_York").tz_localize(None)
@@ -387,17 +464,28 @@ def _load_broad_breadth_closes(anchor_date: str, tickers: tuple[str, ...]) -> pd
             closes = closes.loc[closes.index.date <= anchor]
             closes.columns = [str(c).upper().strip() for c in closes.columns]
             closes = closes.loc[:, ~closes.columns.duplicated()].copy()
-            if not closes.empty:
-                frames.append(closes)
+            return chunk_index, (closes if not closes.empty else None)
         except Exception:
-            continue
+            return chunk_index, None
+
+    frames_by_index: dict[int, pd.DataFrame] = {}
+    # Bounded parallelism keeps external requests under control and avoids serial
+    # waits on every 40-symbol block. Keep the chunk size and adjusted-close source.
+    with ThreadPoolExecutor(max_workers=min(4, len(chunks)), thread_name_prefix="v2-breadth") as pool:
+        futures = [pool.submit(fetch_chunk, chunk) for chunk in chunks]
+        for future in as_completed(futures):
+            chunk_index, frame = future.result()
+            if frame is not None:
+                frames_by_index[chunk_index] = frame
+    frames = [frames_by_index[i] for i in sorted(frames_by_index)]
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, axis=1)
     out = out.loc[:, ~out.columns.duplicated()].sort_index()
     out = out.loc[:, ~out.columns.duplicated()].copy()
-    # A stale broad-universe frame must not silently pass as today's market breadth.
-    if out.empty or pd.Timestamp(out.index[-1]).date() != anchor:
+    # Keep at least the legacy formula's 253-session requirement: if the shorter
+    # request is incomplete, report unavailable rather than manufacturing ranks.
+    if out.empty or pd.Timestamp(out.index[-1]).date() != anchor or len(out) < 253:
         return pd.DataFrame()
     return out
 
@@ -2249,8 +2337,51 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
     elif not symbols:
         st.warning("활성 관심종목이 없습니다. 화면 왼쪽의 Watchlist에서 종목을 추가하거나 비활성화 여부를 확인하세요.")
     else:
-        with st.spinner(f"{len(symbols)}개 종목의 일봉과 공통 엔진 결과를 계산 중…"):
-            result, raw, errors, elapsed = _run_scan(symbols, source)
+        scan_bar = st.progress(0.0, text="스캔 준비 중…")
+        scan_status = st.empty()
+        scan_started_at = time.perf_counter()
+        scan_phase_state: dict[str, Any] = {
+            "name": None,
+            "started_at": scan_started_at,
+            "seconds": {},
+        }
+
+        def _scan_progress(stage: str, done: int, total: int, ticker: str) -> None:
+            now = time.perf_counter()
+            if stage != scan_phase_state["name"]:
+                previous = scan_phase_state["name"]
+                if previous is not None:
+                    scan_phase_state["seconds"][previous] = max(0.0, now - scan_phase_state["started_at"])
+                scan_phase_state["name"] = stage
+                scan_phase_state["started_at"] = now
+            total = max(1, int(total))
+            done = min(max(0, int(done)), total)
+            if stage == "download":
+                fraction = 0.65 * done / total
+                label = f"일봉 다운로드 {done}/{total} · {ticker}"
+            else:
+                fraction = 0.65 + 0.35 * done / total
+                label = f"공통 EOD 엔진 계산 {done}/{total} · {ticker}"
+            scan_bar.progress(min(1.0, fraction), text=label)
+            scan_status.caption("종목별 다운로드와 분석은 병렬 처리 중이며, 한 종목 안의 공식 날짜순 재생은 순서대로 유지합니다.")
+
+        try:
+            result, raw, errors, elapsed = _run_scan(symbols, source, progress_callback=_scan_progress)
+        finally:
+            current_phase = scan_phase_state["name"]
+            if current_phase is not None:
+                scan_phase_state["seconds"][current_phase] = max(
+                    0.0, time.perf_counter() - scan_phase_state["started_at"]
+                )
+            scan_bar.empty()
+            scan_status.empty()
+        download_seconds = scan_phase_state["seconds"].get("download", 0.0)
+        engine_seconds = scan_phase_state["seconds"].get("analysis", 0.0)
+        st.caption(
+            f"성능 진단 · 일봉 다운로드 {download_seconds:.1f}s · 공통 EOD 엔진 {engine_seconds:.1f}s · "
+            f"전체 {max(elapsed, time.perf_counter() - scan_started_at):.1f}s · "
+            f"다운로드 최대 6개 / 엔진 최대 4개 종목 병렬 처리"
+        )
         if result.empty:
             st.error("분석할 수 있는 종목이 없습니다. 데이터 공급원과 심볼을 확인하세요.")
             if page == "Momentum Monitor":
