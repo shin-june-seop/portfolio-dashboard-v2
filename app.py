@@ -82,7 +82,7 @@ from dashboard_v2.services.watchlist_repository import (
 ROOT = Path(__file__).resolve().parent
 PAGES = [
     "Watchlist", "Momentum Monitor", "Live Monitor", "Quality Recovery", "Pattern Scanner", "PP Journal",
-    "Overview", "Holdings", "App Monitor", "ADD Monitor",
+    "Overview", "Holdings",
     "Performance", "Allocation", "Chart", "Leaders",
 ]
 
@@ -430,6 +430,10 @@ def _render_momentum_market_header() -> None:
     st.markdown("## 🔭 Momentum Monitor")
     with st.spinner("완료된 미국 시장 데이터로 Market Score와 Regime을 계산하는 중…"):
         regime = _compute_market_regime()
+    if regime.get("available") and regime.get("data_date"):
+        st.session_state["v2_market_regime_snapshot"] = {
+            "data_date": str(regime.get("data_date")), "label": str(regime.get("label") or "—")
+        }
     if not regime.get("available"):
         st.warning(str(regime.get("action") or "시장 레짐 데이터를 사용할 수 없습니다."))
         with st.expander("시장 데이터 진단"):
@@ -1361,7 +1365,49 @@ def _pp_constructive_context(row: Mapping[str, Any]) -> bool:
     return close is not None and sma50 is not None and sma200 is not None and close > sma50 and sma50 >= sma200
 
 
-def _scan_pp_for_symbols(symbols: list[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[str, str]], float]:
+def _pp_quality_grade(rs, rs_delta, momentum, volume_ratio, base_score, pivot_distance):
+    """Legacy-style PP Quality snapshot; missing inputs are not silently scored as zero."""
+    values = [rs, rs_delta, momentum, volume_ratio, base_score, pivot_distance]
+    if not any(_num_or_none(v) is not None for v in values):
+        return None
+    rs, rs_delta, momentum, volume_ratio, base_score, pivot_distance = [_num_or_none(v) for v in values]
+    score = 0
+    if rs is not None and rs >= 80:
+        score += 2
+    if rs_delta is not None and rs_delta > 0:
+        score += 1
+    if momentum is not None and momentum >= 70:
+        score += 1
+    if volume_ratio is not None and volume_ratio >= 1.2:
+        score += 1
+    if base_score is not None and base_score >= 7:
+        score += 1
+    if pivot_distance is not None and -15 <= pivot_distance <= 0:
+        score += 1
+    return "A" if score >= 6 else ("B" if score >= 4 else "C")
+
+
+def _recalculate_pp_signal_outcomes(saved_signals: list[dict[str, Any]], analyze_pp_signal_outcome) -> None:
+    """Refresh forward outcomes from completed EOD bars only; no official stage events are inferred."""
+    outcomes = []
+    errors = []
+    unique_symbols = list(dict.fromkeys(str(sig.get("ticker", "")).upper() for sig in saved_signals if sig.get("ticker")))
+    bars_cache: dict[str, pd.DataFrame] = {}
+    for symbol in unique_symbols:
+        try:
+            bars_cache[symbol] = _load_yfinance_bars(symbol)
+        except Exception as exc:
+            errors.append((symbol, f"{type(exc).__name__}: {exc}"))
+    for sig in saved_signals:
+        outcome = analyze_pp_signal_outcome(sig, bars_cache.get(str(sig.get("ticker", "")).upper(), pd.DataFrame()))
+        for field in ("signal_price", "candidate_pivot", "breakout_pivot", "pivot_dist_pct", "pp_quality", "rs_rating", "momentum_score", "market_regime", "entry_stage", "pattern_name"):
+            outcome[field] = sig.get(field)
+        outcomes.append(outcome)
+    st.session_state["v2_pp_signal_outcomes"] = outcomes
+    st.session_state["v2_pp_signal_outcome_errors"] = errors
+
+
+def _scan_pp_for_symbols(symbols: list[str], watchlist_rows: list[dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[tuple[str, str]], float]:
     if not symbols:
         return [], [], [], 0.0
     scan_frame, raw_by_symbol, errors, elapsed = _run_scan(symbols, "Yahoo Finance (EOD)")
@@ -1370,6 +1416,14 @@ def _scan_pp_for_symbols(symbols: list[str]) -> tuple[list[dict[str, Any]], list
     if scan_frame.empty:
         return valid_signals, diagnostics, errors, elapsed
     from dashboard_v2.engines.pocket_pivot_engine import detect_pocket_pivot
+
+    quality_context: dict[str, dict[str, Any]] = {}
+    if watchlist_rows:
+        try:
+            quality_context, _context_note = _build_live_monitor_quality_context(scan_frame, raw_by_symbol, watchlist_rows)
+        except Exception:
+            quality_context = {}
+    regime_snapshot = st.session_state.get("v2_market_regime_snapshot", {}) if hasattr(st, "session_state") else {}
 
     for _, series in scan_frame.iterrows():
         row = series.to_dict()
@@ -1394,17 +1448,38 @@ def _scan_pp_for_symbols(symbols: list[str]) -> tuple[list[dict[str, Any]], list
                 "결과": " | ".join(pp.reason_codes),
             })
             continue
+        signal_date = (pp.as_of_date.isoformat() if pp.as_of_date else str(row.get("as_of_date", ""))[:10])
+        signal_price = _num_or_none(row.get("close"))
+        candidate_pivot = _num_or_none(row.get("candidate_pivot"))
+        breakout_pivot = _num_or_none(row.get("breakout_pivot"))
+        pivot_ref = breakout_pivot if breakout_pivot is not None else candidate_pivot
+        pivot_dist_pct = ((signal_price / pivot_ref - 1.0) * 100.0) if signal_price and pivot_ref and pivot_ref > 0 else None
+        quality_row = quality_context.get(symbol, {})
+        rs_rating = _num_or_none(quality_row.get("RS"))
+        momentum_score = _num_or_none(quality_row.get("Momentum"))
+        rs_delta = _num_or_none(quality_row.get("_rs_delta"))
+        base_score = _num_or_none(quality_row.get("_base_score"))
+        volume_ratio = _num_or_none(row.get("rvol"))
+        if volume_ratio is None:
+            volume_ratio = _num_or_none(row.get("RVOL"))
+        pp_quality = _pp_quality_grade(rs_rating, rs_delta, momentum_score, volume_ratio, base_score, pivot_dist_pct)
+        market_regime = regime_snapshot.get("label") if str(regime_snapshot.get("data_date", ""))[:10] == signal_date else None
         valid_signals.append({
             "ticker": symbol,
-            "signal_date": (pp.as_of_date.isoformat() if pp.as_of_date else str(row.get("as_of_date", ""))[:10]),
-            "signal_price": _num_or_none(row.get("close")),
+            "signal_date": signal_date,
+            "signal_price": signal_price,
             "signal_volume": pp.signal_volume,
             "max_prior_down_day_volume": pp.max_prior_down_day_volume,
             "reference_ma": pp.reference_ma,
             "pattern_name": row.get("pattern") or "BASE FORMING / NO VALID PATTERN",
             "entry_stage": row.get("stage") or "BASE",
-            "candidate_pivot": _num_or_none(row.get("candidate_pivot")),
-            "breakout_pivot": _num_or_none(row.get("breakout_pivot")),
+            "candidate_pivot": candidate_pivot,
+            "breakout_pivot": breakout_pivot,
+            "rs_rating": rs_rating,
+            "momentum_score": momentum_score,
+            "pp_quality": pp_quality,
+            "market_regime": market_regime,
+            "pivot_dist_pct": pivot_dist_pct,
             "context_valid": bool(pp.context_valid),
             "reason_codes": list(pp.reason_codes),
             "valid_signal": bool(pp.valid_signal),
@@ -1412,7 +1487,7 @@ def _scan_pp_for_symbols(symbols: list[str]) -> tuple[list[dict[str, Any]], list
     return valid_signals, diagnostics, errors, elapsed
 
 
-def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
+def _render_pp_journal_page(client, user_id: str, symbols: list[str], watchlist_rows: list[dict[str, Any]] | None = None) -> None:
     from datetime import date
     from dashboard_v2.services.pp_journal_repository import (
         ENTRY_STAGES, EXIT_REASONS, PPJournalValidationError,
@@ -1424,49 +1499,62 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
         analyze_pp_signal_outcome, summarize_trade, summarize_trades,
     )
 
-    st.subheader("PP Journal")
-    st.caption("Pocket Pivot 신호와 실제 거래를 분리해 기록합니다. 거래 입력은 수동 기록이며 주문 제출·자동 청산은 하지 않습니다.")
+    st.subheader("🧪 Pocket Pivot Journal")
+    st.caption("PP Tracking은 모든 유효 PP Signal을 기록하고, PP Trade는 실제 매수만 기록하며, PP Analytics는 신호 후속 가격 움직임과 실제 거래 성과를 분리해 보여줍니다. 주문 제출·자동 매매는 없습니다.")
+    pp_journal_view = st.radio(
+        "PP Journal 보기", ["📡 PP Tracking", "📝 PP Trade", "📊 PP Analytics"],
+        horizontal=True, key="v2_pp_journal_view", label_visibility="collapsed"
+    )
     with st.expander("저장·계산 기준", expanded=False):
         st.markdown(
-            "- **PP Signal:** 완료 일봉 공통 엔진의 Pocket Pivot 조건을 통과한 이벤트만 저장합니다. 사용자·티커·신호일 조합으로 중복을 막고 당시 가격/거래량/피봇/Stage를 보존합니다.\n"
+            "- **PP Signal:** 완료 일봉 공통 엔진의 Pocket Pivot 조건을 통과한 이벤트만 저장합니다. 사용자·티커·신호일 조합으로 중복을 막고 당시 가격/거래량/피봇/Stage와 이용 가능한 RS/Momentum/Quality/Regime 스냅샷을 보존합니다.\n"
             "- **Trade:** 최초 진입, 추가매수, 부분청산, 전량청산은 별도 행으로 추가됩니다. 최초 Stage와 진입 시점의 초기 손절선은 나중의 Stage 변화로 덮어쓰지 않습니다.\n"
             "- **Position 상태:** OPEN은 청산 기록 없음, PARTIAL은 일부 청산 후 잔여 수량이 있음, CLOSED는 잔여 수량이 0인 경우에만 표시합니다. 예를 들어 90% 청산 후 10%가 남으면 PARTIAL입니다.\n"
             "- **손익:** 청산 손익은 진입 건을 시간순으로 적용하는 FIFO 기준 참고치입니다. 세무/브로커 명세서와 별개의 저널 분석값입니다.\n"
-            "- **신호 후속 결과:** +10%/+20%, MFE/MAE, 저장 당시 Candidate Pivot의 고가 도달만 완료 일봉의 가격 움직임으로 측정합니다. 이는 공식 BREAKOUT/FAILURE 이벤트와 같지 않으며 그 이벤트 통계는 공식 날짜별 Stage 이벤트 원장과 연결된 뒤에만 표시합니다."
+            "- **신호 후속 결과:** +5%/+10%/+20%, MFE/MAE, 저장 당시 기준 Pivot 도달과 돌파 후 실패 여부는 신호일 다음 완료 일봉으로 측정합니다. 이는 가격 관측값이지 공식 ENTRY STAGE의 BREAKOUT/FAILURE 이벤트가 아닙니다.\n"
+            "- **신호 스냅샷 컬럼:** RS/Momentum/PP Quality/Market Regime/Pivot 거리를 영구 저장하려면 V2 Supabase에서 `sql/v2_pp_journal_tracking_metrics.sql`을 한 번 실행합니다. 적용 전에도 기본 저널은 동작하지만 해당 추가 값은 보존되지 않습니다. 기존 신호에 오늘 값을 소급 적용하지 않습니다."
         )
 
     try:
         saved_signals = list_pp_signals(client, user_id)
-        trades = list_pp_trades(client, user_id)
-        trade_ids = [str(row.get("id")) for row in trades]
-        all_adds = list_trade_adds(client, user_id, trade_ids)
-        all_exits = list_trade_exits(client, user_id, trade_ids)
+        if pp_journal_view in {"📝 PP Trade", "📊 PP Analytics"}:
+            trades = list_pp_trades(client, user_id)
+            trade_ids = [str(row.get("id")) for row in trades]
+            all_adds = list_trade_adds(client, user_id, trade_ids)
+            all_exits = list_trade_exits(client, user_id, trade_ids)
+        else:
+            trades, all_adds, all_exits = [], [], []
     except Exception as exc:
         st.error(f"PP Journal 테이블을 읽을 수 없습니다: {type(exc).__name__}: {exc}")
-        st.info("새 V2 Supabase 프로젝트의 SQL Editor에서 `sql/v2_pp_journal_schema.sql`을 실행했는지 확인하세요. 기존 Watchlist SQL을 다시 실행할 필요는 없습니다.")
+        st.info("V2 Supabase SQL Editor에서 `sql/v2_pp_journal_schema.sql`과 `sql/v2_pp_journal_tracking_metrics.sql`을 순서대로 실행했는지 확인하세요. 기존 Watchlist SQL을 다시 실행할 필요는 없습니다.")
         return
 
-    tab_signal, tab_trade, tab_analytics = st.tabs(["PP Signals", "실제 거래 기록", "성과 분석"])
-
-    with tab_signal:
+    if pp_journal_view == "📡 PP Tracking":
         st.markdown("#### 활성 관심종목에서 PP 신호 탐색")
         if not symbols:
             st.info("활성 관심종목이 없습니다. Watchlist에서 종목을 활성화해 주세요. 이미 저장된 신호와 거래 기록은 아래에 계속 보존됩니다.")
         c1, c2 = st.columns([1, 3])
-        if c1.button("완료 일봉 PP 재스캔", type="primary", key="v2_pp_scan"):
+        if c1.button("완료 일봉 PP 재스캔 및 기록", type="primary", key="v2_pp_scan"):
+            st.session_state.pop("v2_pp_scan_save_result", None)
+            st.session_state.pop("v2_pp_scan_save_error", None)
             if not symbols:
-                st.session_state["v2_pp_scan_results"] = []
-                st.session_state["v2_pp_scan_diagnostics"] = []
-                st.session_state["v2_pp_scan_errors"] = []
+                valid, diagnostics, errors, elapsed = [], [], [], 0.0
             else:
                 with st.spinner(f"{len(symbols)}개 활성 관심종목의 완료 일봉 PP 조건을 확인 중…"):
-                    valid, diagnostics, errors, elapsed = _scan_pp_for_symbols(symbols)
-                st.session_state["v2_pp_scan_results"] = valid
-                st.session_state["v2_pp_scan_diagnostics"] = diagnostics
-                st.session_state["v2_pp_scan_errors"] = errors
-                st.session_state["v2_pp_scan_elapsed"] = elapsed
+                    valid, diagnostics, errors, elapsed = _scan_pp_for_symbols(symbols, watchlist_rows)
+            st.session_state["v2_pp_scan_results"] = valid
+            st.session_state["v2_pp_scan_diagnostics"] = diagnostics
+            st.session_state["v2_pp_scan_errors"] = errors
+            st.session_state["v2_pp_scan_elapsed"] = elapsed
+            if valid:
+                try:
+                    st.session_state["v2_pp_scan_save_result"] = save_pp_signals(client, user_id, valid)
+                except Exception as exc:
+                    st.session_state["v2_pp_scan_save_error"] = f"{type(exc).__name__}: {exc}"
+            else:
+                st.session_state["v2_pp_scan_save_result"] = {"inserted": 0, "duplicates": 0}
             st.rerun()
-        c2.caption("현재 완료 일봉을 다시 계산합니다. 장중 5분봉은 신호 탐지/저장에 사용하지 않습니다.")
+        c2.caption("완료 일봉으로 PP 조건을 계산하고 신규 신호를 즉시 기록합니다. 사용자·종목·신호일 중복은 자동으로 건너뜁니다. 장중 5분봉은 신호 탐지/저장에 사용하지 않습니다.")
 
         scan_results = st.session_state.get("v2_pp_scan_results", [])
         if scan_results:
@@ -1479,18 +1567,26 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
                 "signal_volume": "신호일 거래량", "max_prior_down_day_volume": "직전 하락일 최대 거래량",
                 "reference_ma": "참조 MA", "pattern_name": "패턴", "entry_stage": "Stage",
                 "candidate_pivot": "저장 당시 Candidate Pivot", "breakout_pivot": "저장 당시 Breakout Pivot",
+                "rs_rating": "RS", "momentum_score": "Momentum", "pp_quality": "PP Quality",
+                "market_regime": "Market Regime", "pivot_dist_pct": "Pivot 거리 (%)",
             })
-            show_cols = [col for col in ["종목", "신호일", "신호 가격", "신호일 거래량", "직전 하락일 최대 거래량", "참조 MA", "패턴", "Stage", "저장 당시 Candidate Pivot", "저장 당시 Breakout Pivot"] if col in scan_view]
+            show_cols = [col for col in ["종목", "신호일", "신호 가격", "신호일 거래량", "직전 하락일 최대 거래량", "참조 MA", "패턴", "Stage", "저장 당시 Candidate Pivot", "저장 당시 Breakout Pivot", "Pivot 거리 (%)", "RS", "Momentum", "PP Quality", "Market Regime"] if col in scan_view]
             st.dataframe(scan_view[show_cols], use_container_width=True, hide_index=True)
-            if st.button("유효 PP 신호 저장", type="primary", key="v2_pp_save_signals"):
-                try:
-                    saved = save_pp_signals(client, user_id, scan_results)
-                    st.success(f"신규 저장 {saved['inserted']}건 · 중복으로 건너뜀 {saved['duplicates']}건")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"PP 신호 저장 실패: {type(exc).__name__}: {exc}")
         elif "v2_pp_scan_results" in st.session_state:
             st.info("현재 완료 일봉 기준으로 유효 PP 신호가 없습니다. 임의로 신호를 만들거나 이전 날짜 신호로 대체하지 않았습니다.")
+        scan_save_result = st.session_state.get("v2_pp_scan_save_result")
+        if scan_save_result is not None:
+            st.success(f"스캔 완료 · 신규 신호 {scan_save_result.get('inserted', 0)}건 기록 · 중복 {scan_save_result.get('duplicates', 0)}건 건너뜀")
+        scan_save_error = st.session_state.get("v2_pp_scan_save_error")
+        if scan_save_error:
+            st.error(f"신호 자동 기록 실패: {scan_save_error}")
+            if scan_results and st.button("스캔 결과 저장 재시도", key="v2_pp_scan_save_retry"):
+                try:
+                    st.session_state["v2_pp_scan_save_result"] = save_pp_signals(client, user_id, scan_results)
+                    st.session_state.pop("v2_pp_scan_save_error", None)
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"PP 신호 저장 재시도 실패: {type(exc).__name__}: {exc}")
 
         scan_errors = st.session_state.get("v2_pp_scan_errors", [])
         if scan_errors:
@@ -1501,25 +1597,46 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
             with st.expander(f"PP 조건 미충족/진단 ({len(rejected)}종목)", expanded=False):
                 st.dataframe(pd.DataFrame(rejected), use_container_width=True, hide_index=True)
 
-        st.markdown("#### 저장된 PP Signal")
+        st.markdown("#### 저장된 PP Signal · Tracking")
         if saved_signals:
-            signal_view = pd.DataFrame(saved_signals)
-            signal_view = signal_view.rename(columns={
-                "ticker": "종목", "signal_date": "신호일", "signal_price": "신호 가격",
-                "signal_volume": "신호일 거래량", "max_prior_down_day_volume": "직전 하락일 최대 하락일 거래량",
-                "reference_ma": "참조 MA", "pattern_name": "당시 패턴", "entry_stage": "당시 Stage",
-                "candidate_pivot": "당시 Candidate Pivot", "breakout_pivot": "당시 Breakout Pivot",
-            })
-            cols = ["종목", "신호일", "신호 가격", "신호일 거래량", "직전 하락일 최대 하락일 거래량", "참조 MA", "당시 패턴", "당시 Stage", "당시 Candidate Pivot", "당시 Breakout Pivot"]
-            signal_view = signal_view[[c for c in cols if c in signal_view.columns]].copy()
-            for col in ("신호 가격", "당시 Candidate Pivot", "당시 Breakout Pivot"):
-                if col in signal_view:
-                    signal_view[col] = signal_view[col].map(lambda v: _fmt_num(v))
-            st.dataframe(signal_view, use_container_width=True, hide_index=True)
+            tracking_rows = []
+            outcome_map = {
+                (str(row.get("ticker", "")).upper(), str(row.get("signal_date", ""))[:10]): row
+                for row in st.session_state.get("v2_pp_signal_outcomes", [])
+            }
+            for sig in saved_signals:
+                key = (str(sig.get("ticker", "")).upper(), str(sig.get("signal_date", ""))[:10])
+                outcome = outcome_map.get(key, {})
+                tracking_rows.append({
+                    "종목": sig.get("ticker"), "신호일": str(sig.get("signal_date", ""))[:10],
+                    "PP 가격": sig.get("signal_price"), "Pivot 거리 (%)": sig.get("pivot_dist_pct"),
+                    "RS": sig.get("rs_rating"), "Momentum": sig.get("momentum_score"),
+                    "PP Quality": sig.get("pp_quality"), "Market Regime": sig.get("market_regime"),
+                    "Pivot": outcome.get("reference_pivot_reached"),
+                    "Breakout": outcome.get("breakout_reached"),
+                    "Breakout Failure": outcome.get("breakout_failure_reached"),
+                    "Failure 일": outcome.get("breakout_failure_date"),
+                    "+5%": outcome.get("hit_plus_5_pct"), "+10%": outcome.get("hit_plus_10_pct"),
+                    "+20%": outcome.get("hit_plus_20_pct"), "MFE (%)": outcome.get("mfe_pct"),
+                    "MAE (%)": outcome.get("mae_pct"), "상태": outcome.get("outcome_status", "결과 미계산"),
+                })
+            tracking_frame = pd.DataFrame(tracking_rows)
+            for col in ("Pivot", "Breakout", "Breakout Failure", "+5%", "+10%", "+20%"):
+                tracking_frame[col] = tracking_frame[col].map(lambda v: "✓" if pd.notna(v) and bool(v) else "—")
+            for col in ("PP 가격", "Pivot 거리 (%)", "MFE (%)", "MAE (%)"):
+                tracking_frame[col] = tracking_frame[col].map(lambda v: _fmt_num(v) if v is not None and pd.notna(v) else "—")
+            for col in ("RS", "Momentum"):
+                tracking_frame[col] = tracking_frame[col].map(lambda v: _fmt_num(v, 1) if v is not None and pd.notna(v) else "—")
+            st.dataframe(tracking_frame, use_container_width=True, hide_index=True)
+            if st.button("후속 완료 일봉 결과 업데이트", key="v2_pp_revalue_outcomes_tracking"):
+                with st.spinner("신호일 이후 완료 일봉으로 PP 후속 결과를 계산 중…"):
+                    _recalculate_pp_signal_outcomes(saved_signals, analyze_pp_signal_outcome)
+                st.rerun()
+            st.caption("Pivot/Breakout/Failure는 저장된 기준 Pivot에 대한 후속 일봉 가격 관측입니다. 공식 ENTRY STAGE 이벤트를 대체하지 않습니다. RS·Momentum·Quality·Market Regime은 신호 저장 시 확보된 값만 표시되며, 값이 없으면 추정하지 않습니다. 값이 계속 비어 있으면 `sql/v2_pp_journal_tracking_metrics.sql` 적용 여부를 확인하세요.")
         else:
             st.caption("아직 저장된 PP 신호가 없습니다.")
 
-    with tab_trade:
+    elif pp_journal_view == "📝 PP Trade":
         st.markdown("#### 최초 진입 기록")
         signal_options: dict[str, dict[str, Any] | None] = {"연결 안 함": None}
         for sig in saved_signals:
@@ -1542,6 +1659,11 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
             stage_index = ENTRY_STAGES.index(stage_default) if stage_default in ENTRY_STAGES else 0
             entry_stage = e.selectbox("최초 진입 Stage (고정 기록)", ENTRY_STAGES, index=stage_index)
             initial_stop = f.number_input("최초 진입 당시 초기 손절선 · 선택", min_value=0.0, value=0.0, step=0.5, format="%.4f")
+            entry_reasons = st.multiselect(
+                "매수 근거 (선택)",
+                ["RS 개선", "좋은 Base", "VCP 양호", "MA 지지", "거래량 증가", "Pivot 접근", "Market Regime 양호", "추세 구조 양호", "기타"],
+                key="v2_pp_entry_reasons",
+            )
             notes = st.text_area("거래 메모", max_chars=1500, placeholder="진입 이유, 셋업, 계획 등")
             create_submitted = st.form_submit_button("최초 진입 기록 저장", type="primary", use_container_width=True)
         if create_submitted:
@@ -1553,7 +1675,8 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
                     initial_entry_date=entry_date, initial_entry_price=entry_price,
                     initial_shares=shares, initial_weight_pct=(weight if weight > 0 else None),
                     initial_entry_stage=entry_stage,
-                    initial_stop_price=(initial_stop if initial_stop > 0 else None), notes=notes,
+                    initial_stop_price=(initial_stop if initial_stop > 0 else None),
+                    notes=(("[매수 근거] " + ", ".join(entry_reasons) + "\n" if entry_reasons else "") + notes)[:1500],
                 )
                 st.success(f"{created['ticker']} 최초 진입을 기록했습니다. ID: {str(created['id'])[:8]}")
                 st.rerun()
@@ -1669,7 +1792,7 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
         else:
             st.info("아직 거래 기록이 없습니다. 위에서 최초 진입부터 기록해 주세요. PP 신호를 연결하지 않고 수동 거래를 기록할 수도 있습니다.")
 
-    with tab_analytics:
+    elif pp_journal_view == "📊 PP Analytics":
         trade_summaries = []
         for trade in trades:
             tid = str(trade.get("id"))
@@ -1697,25 +1820,11 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
 
         st.markdown("#### 저장 PP 신호의 후속 가격 움직임")
         if not saved_signals:
-            st.caption("신호가 저장되면 완료 일봉의 이후 High/Low를 기준으로 MFE/MAE와 +10%/+20% 도달을 계산할 수 있습니다.")
+            st.caption("신호가 저장되면 완료 일봉의 이후 High/Low를 기준으로 MFE/MAE와 +5%/+10%/+20% 도달을 계산할 수 있습니다.")
         else:
             if st.button("후속 EOD 결과 재계산", key="v2_pp_revalue_outcomes"):
-                outcomes = []
-                errors = []
-                unique_symbols = list(dict.fromkeys(str(sig.get("ticker", "")).upper() for sig in saved_signals if sig.get("ticker")))
-                bars_cache: dict[str, pd.DataFrame] = {}
-                for symbol in unique_symbols:
-                    try:
-                        bars_cache[symbol] = _load_yfinance_bars(symbol)
-                    except Exception as exc:
-                        errors.append((symbol, f"{type(exc).__name__}: {exc}"))
-                for sig in saved_signals:
-                    outcome = analyze_pp_signal_outcome(sig, bars_cache.get(str(sig.get("ticker", "")).upper(), pd.DataFrame()))
-                    outcome["signal_price"] = sig.get("signal_price")
-                    outcome["candidate_pivot"] = sig.get("candidate_pivot")
-                    outcomes.append(outcome)
-                st.session_state["v2_pp_signal_outcomes"] = outcomes
-                st.session_state["v2_pp_signal_outcome_errors"] = errors
+                with st.spinner("신호일 이후 완료 일봉으로 PP 후속 결과를 계산 중…"):
+                    _recalculate_pp_signal_outcomes(saved_signals, analyze_pp_signal_outcome)
                 st.rerun()
 
             outcomes = st.session_state.get("v2_pp_signal_outcomes", [])
@@ -1723,24 +1832,77 @@ def _render_pp_journal_page(client, user_id: str, symbols: list[str]) -> None:
                 outcome_frame = pd.DataFrame(outcomes)
                 outcome_frame = outcome_frame.rename(columns={
                     "ticker": "종목", "signal_date": "신호일", "signal_price": "신호 가격",
-                    "candidate_pivot": "저장 당시 Candidate Pivot", "candidate_pivot_touched": "피봇 고가 도달",
+                    "candidate_pivot": "저장 당시 Candidate Pivot", "breakout_pivot": "저장 당시 Breakout Pivot",
+                    "pp_quality": "PP Quality", "market_regime": "Signal 당시 Market Regime",
+                    "entry_stage": "Signal 당시 Stage", "pattern_name": "Signal 당시 Pattern",
+                    "candidate_pivot_touched": "Candidate Pivot 고가 도달", "reference_pivot_reached": "기준 Pivot 도달",
+                    "breakout_reached": "종가 돌파 관측", "breakout_failure_reached": "돌파 실패 관측",
+                    "breakout_failure_date": "실패 관측일", "hit_plus_5_pct": "+5% 도달",
                     "hit_plus_10_pct": "+10% 도달", "hit_plus_20_pct": "+20% 도달",
                     "mfe_pct": "MFE (%)", "mae_pct": "MAE (%)", "observed_bars": "후속 완료 일봉 수",
                     "outcome_status": "결과 상태",
                 })
-                wanted = ["종목", "신호일", "신호 가격", "저장 당시 Candidate Pivot", "피봇 고가 도달", "+10% 도달", "+20% 도달", "MFE (%)", "MAE (%)", "후속 완료 일봉 수", "결과 상태"]
+                wanted = ["종목", "신호일", "신호 가격", "Signal 당시 Pattern", "Signal 당시 Stage", "PP Quality", "Signal 당시 Market Regime", "저장 당시 Candidate Pivot", "저장 당시 Breakout Pivot", "기준 Pivot 도달", "종가 돌파 관측", "돌파 실패 관측", "실패 관측일", "+5% 도달", "+10% 도달", "+20% 도달", "MFE (%)", "MAE (%)", "후속 완료 일봉 수", "결과 상태"]
                 outcome_frame = outcome_frame[[col for col in wanted if col in outcome_frame.columns]]
-                for col in ("신호 가격", "저장 당시 Candidate Pivot", "MFE (%)", "MAE (%)"):
+                for col in ("신호 가격", "저장 당시 Candidate Pivot", "저장 당시 Breakout Pivot", "MFE (%)", "MAE (%)"):
                     if col in outcome_frame:
                         outcome_frame[col] = outcome_frame[col].map(lambda v: _fmt_num(v) if v is not None and pd.notna(v) else "—")
                 st.dataframe(outcome_frame, use_container_width=True, hide_index=True)
                 observed = [row for row in outcomes if row.get("outcome_status") == "OBSERVED_PRICE_EXCURSION"]
                 if observed:
-                    for label, key in (("저장 당시 피봇 고가 도달률", "candidate_pivot_touched"), ("+10% 도달률", "hit_plus_10_pct"), ("+20% 도달률", "hit_plus_20_pct")):
+                    for label, key in (("기준 Pivot 도달률", "reference_pivot_reached"), ("종가 돌파 관측률", "breakout_reached"), ("돌파 실패 관측률", "breakout_failure_reached"), ("+5% 도달률", "hit_plus_5_pct"), ("+10% 도달률", "hit_plus_10_pct"), ("+20% 도달률", "hit_plus_20_pct")):
                         values = [row.get(key) for row in observed if row.get(key) is not None]
                         rate = sum(bool(x) for x in values) / len(values) * 100 if values else None
                         st.metric(label, "—" if rate is None else f"{rate:.1f}%", help=f"결과가 관찰된 {len(values)}개 신호 기준. 저장 당시 후보 피봇이 없거나 후속 일봉이 없는 신호는 해당 비율의 분모에서 제외됩니다.")
-                st.caption("MFE/MAE는 신호일 다음 완료 일봉부터 계산합니다. 재베이스나 패턴 변경 이후에도 저장된 피봇선은 스냅샷으로 유지되며, 고가 도달을 공식 BREAKOUT으로 간주하지 않습니다.")
+                st.caption("MFE/MAE는 신호일 다음 완료 일봉부터 계산합니다. 종가 돌파·실패 비율은 저장된 기준 Pivot의 가격 관측 통계이며 공식 Stage 이벤트 통계가 아닙니다. 새 패턴이 생겨도 저장된 스냅샷 값은 바뀌지 않습니다.")
+                observed_frame = pd.DataFrame([row for row in outcomes if row.get("outcome_status") == "OBSERVED_PRICE_EXCURSION"])
+                if not observed_frame.empty:
+                    st.markdown("#### PP Quality별 신호 후속 결과")
+                    signal_meta = { (str(sig.get("ticker", "")).upper(), str(sig.get("signal_date", ""))[:10]): sig for sig in saved_signals }
+                    for idx, row in observed_frame.iterrows():
+                        meta = signal_meta.get((str(row.get("ticker", "")).upper(), str(row.get("signal_date", ""))[:10]), {})
+                        observed_frame.loc[idx, "pp_quality"] = meta.get("pp_quality") or "미평가"
+                    grouped_rows = []
+                    for quality, group in observed_frame.groupby("pp_quality", dropna=False):
+                        def _pct_true(field, subset):
+                            vals = [v for v in subset[field].tolist() if v is not None and pd.notna(v)] if field in subset else []
+                            return round(sum(bool(v) for v in vals) / len(vals) * 100, 1) if vals else np.nan
+                        breakout_vals = [v for v in group["breakout_reached"].tolist() if v is not None and pd.notna(v)]
+                        failure_vals = [v for v in group["breakout_failure_reached"].tolist() if v is not None and pd.notna(v)]
+                        breakout_n = sum(bool(v) for v in breakout_vals)
+                        failure_n = sum(bool(v) for v in failure_vals)
+                        grouped_rows.append({
+                            "PP Quality": quality, "관측 신호 수": len(group),
+                            "Pivot 도달률 (%)": _pct_true("reference_pivot_reached", group),
+                            "종가 돌파 관측률 (%)": _pct_true("breakout_reached", group),
+                            "돌파 실패 관측률 (%)": _pct_true("breakout_failure_reached", group),
+                            "돌파→실패 비율 (%)": round(failure_n / breakout_n * 100, 1) if breakout_n else np.nan,
+                            "+5% 도달률 (%)": _pct_true("hit_plus_5_pct", group),
+                            "+10% 도달률 (%)": _pct_true("hit_plus_10_pct", group),
+                            "+20% 도달률 (%)": _pct_true("hit_plus_20_pct", group),
+                        })
+                    st.dataframe(pd.DataFrame(grouped_rows), use_container_width=True, hide_index=True)
+            if trade_summaries:
+                st.markdown("#### 실제 최초 진입 Stage별 성과")
+                stage_rows = []
+                for entry_stage, group in pd.DataFrame(trade_summaries).groupby("initial_entry_stage", dropna=False):
+                    group_closed = group[group["status"].astype(str).str.upper().eq("CLOSED")]
+                    returns = pd.to_numeric(group_closed.get("realized_return_pct"), errors="coerce")
+                    wins = returns[returns > 0]
+                    losses = returns[returns < 0]
+                    pnl = pd.to_numeric(group["realized_pnl"], errors="coerce")
+                    rvals = pd.to_numeric(group_closed.get("r_multiple"), errors="coerce")
+                    stage_rows.append({
+                        "최초 진입 Stage": entry_stage or "미기록", "Position 수": len(group),
+                        "전량 종료 수": len(group_closed),
+                        "승률 (%)": round((returns > 0).mean() * 100, 1) if not returns.dropna().empty else np.nan,
+                        "평균 승리 (%)": round(float(wins.mean()), 2) if not wins.empty else np.nan,
+                        "평균 손실 (%)": round(float(losses.mean()), 2) if not losses.empty else np.nan,
+                        "평균 R": round(float(rvals.mean()), 2) if rvals.notna().any() else np.nan,
+                        "누적 실현손익 ($)": round(float(pnl.sum()), 2) if pnl.notna().any() else 0.0,
+                    })
+                st.dataframe(pd.DataFrame(stage_rows), use_container_width=True, hide_index=True)
+                st.caption("Stage 성과는 각 Position의 최초 실제 진입 Stage 기준입니다. 추가매수 Stage는 PP Trade의 개별 거래 원장에서 확인합니다.")
             outcome_errors = st.session_state.get("v2_pp_signal_outcome_errors", [])
             if outcome_errors:
                 with st.expander(f"후속 데이터 조회 오류 ({len(outcome_errors)})", expanded=False):
@@ -1932,7 +2094,7 @@ elif page == "Quality Recovery":
     _render_quality_recovery_page(symbols, source)
 
 elif page == "PP Journal":
-    _render_pp_journal_page(supabase_client, user_id, symbols)
+    _render_pp_journal_page(supabase_client, user_id, symbols, watchlist_rows)
 
 elif page in {"Momentum Monitor", "Pattern Scanner"}:
     if page == "Momentum Monitor":
@@ -2003,24 +2165,6 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
             with st.expander(f"데이터/분석 오류 ({len(errors)})", expanded=bool(errors)):
                 st.dataframe(pd.DataFrame(errors, columns=["종목", "오류"]), use_container_width=True, hide_index=True)
 
-elif page == "App Monitor":
-    st.subheader("App Monitor — V2 구현 상태")
-    status_rows = [
-        ("공통 OHLCV 검증", "구현·테스트"),
-        ("날짜순 재베이스/패턴/피봇 재생", "구현·테스트"),
-        ("Momentum Monitor 공통 엔진 연결", "구현"),
-        ("Pattern Scanner 공통 엔진 연결", "구현"),
-        ("Live Monitor 장중 5분봉 + freshness guard", "구현·테스트 · Yahoo 잠정 공급원"),
-        ("Yahoo Finance 공급원", "EOD 정책 적용 · 장중 데이터는 별도 잠정 공급원"),
-        ("7개 회귀 종목 과거 스냅샷", "포함·정답 라벨은 미검증"),
-        ("V2 전용 Supabase Watchlist + RLS", "연결됨 · 사용자별 RLS"),
-        ("PP Signal / Trade / Add / Exit Journal", "V2 전용 append-only 테이블 · 수동 기록"),
-        ("Quality Recovery Radar · legacy V30 rules", "V2 Watchlist + Yahoo annual fundamentals + 120/200MA recovery + V30.5 RS"),
-        ("나머지 화면 전체 기능 이관", "후속 구현"),
-        ("주문 제출/자동 매매", "미구현·비활성"),
-    ]
-    st.dataframe(pd.DataFrame(status_rows, columns=["기능", "상태"]), use_container_width=True, hide_index=True)
-    st.info("관심종목과 PP Journal만 신규 V2 Supabase에 저장합니다. PP Signal과 실제 체결은 별도 테이블에 기록되며, 주문 제출/자동 매매는 구현하지 않았습니다.")
 
 elif page == "Overview":
     st.subheader("Overview")
