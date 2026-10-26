@@ -97,13 +97,99 @@ def test_signal_outcomes_use_only_bars_after_signal_date_and_fail_closed_when_no
     result = analyze_pp_signal_outcome(signal, bars)
     assert result["observed_bars"] == 2
     assert result["candidate_pivot_touched"] is True
+    assert result["hit_plus_5_pct"] is True
     assert result["hit_plus_10_pct"] is True
     assert result["hit_plus_20_pct"] is True
+    assert result["reference_pivot_reached"] is True
+    assert result["breakout_reached"] is True
+    assert result["breakout_failure_reached"] is False
     assert result["mfe_pct"] == pytest.approx(21)
     assert result["mae_pct"] == pytest.approx(-1)
     no_future = analyze_pp_signal_outcome(signal, bars.iloc[:1])
     assert no_future["mfe_pct"] is None
     assert no_future["hit_plus_10_pct"] is None
+
+
+def test_signal_outcome_observes_close_breakout_then_two_percent_pivot_failure():
+    signal = {"ticker": "NVDA", "signal_date": "2026-10-20", "signal_price": 100,
+              "candidate_pivot": 108, "breakout_pivot": 110}
+    bars = pd.DataFrame({
+        "Date": pd.to_datetime(["2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23"]),
+        "High": [125, 112, 111, 108], "Low": [90, 100, 104, 102],
+        "Close": [100, 111, 109, 107.8],
+    })
+    result = analyze_pp_signal_outcome(signal, bars)
+    assert result["breakout_reached"] is True
+    assert result["breakout_failure_reached"] is True
+    assert result["breakout_failure_date"] == "2026-10-23"
+    # The signal-day spike is excluded: MFE remains based on the later 112 high.
+    assert result["mfe_pct"] == pytest.approx(12)
+
+
+def test_signal_snapshot_metrics_are_optional_and_validated():
+    base = {"ticker": "NVDA", "signal_date": "2026-10-22", "signal_price": 180,
+            "signal_volume": 5_000_000, "max_prior_down_day_volume": 4_000_000,
+            "rs_rating": 86.5, "momentum_score": 77, "pp_quality": "B",
+            "market_regime": "🟠 조정 / 방어", "pivot_dist_pct": -4.5}
+    saved = normalize_pp_signal(base, user_id="u")
+    assert saved["rs_rating"] == pytest.approx(86.5)
+    assert saved["momentum_score"] == pytest.approx(77)
+    assert saved["pp_quality"] == "B"
+    assert saved["pivot_dist_pct"] == pytest.approx(-4.5)
+    with pytest.raises(PPJournalValidationError, match="RS는 0~100"):
+        normalize_pp_signal({**base, "rs_rating": 120}, user_id="u")
+    with pytest.raises(PPJournalValidationError, match="PP Quality"):
+        normalize_pp_signal({**base, "pp_quality": "D"}, user_id="u")
+
+
+def test_tracking_metrics_migration_is_additive_and_does_not_delete_data():
+    from pathlib import Path
+    sql = (Path(__file__).resolve().parents[1] / "sql" / "v2_pp_journal_tracking_metrics.sql").read_text().lower()
+    for column in ("rs_rating", "momentum_score", "pp_quality", "market_regime", "pivot_dist_pct"):
+        assert f"add column if not exists {column}" in sql
+    assert "drop table" not in sql
+    assert "delete from" not in sql
+    assert "update public.v2_pp_signals" not in sql
+
+
+def test_pp_journal_navigation_has_tracking_trade_analytics_and_removes_unused_tabs():
+    from pathlib import Path
+    app = (Path(__file__).resolve().parents[1] / "app.py").read_text()
+    pages = app.split("PAGES = [", 1)[1].split("]", 1)[0]
+    assert '"App Monitor"' not in pages
+    assert '"ADD Monitor"' not in pages
+    assert '"📡 PP Tracking"' in app
+    assert '"📝 PP Trade"' in app
+    assert '"📊 PP Analytics"' in app
+    assert 'elif page == "App Monitor"' not in app
+
+
+
+def test_list_signals_falls_back_to_base_schema_before_metrics_migration():
+    from dashboard_v2.services.pp_journal_repository import list_pp_signals
+    selects = []
+    class Response:
+        def __init__(self, data): self.data = data
+    class Query:
+        def __init__(self): self.columns = ""
+        def select(self, columns):
+            self.columns = columns
+            selects.append(columns)
+            return self
+        def eq(self, *_): return self
+        def order(self, *_args, **_kwargs): return self
+        def limit(self, *_): return self
+        def execute(self):
+            if "rs_rating" in self.columns:
+                raise RuntimeError("Could not find the 'rs_rating' column in the schema cache")
+            return Response([{"ticker": "NVDA", "signal_date": "2026-10-22"}])
+    class Client:
+        def table(self, _): return Query()
+    rows = list_pp_signals(Client(), "user-a")
+    assert len(selects) == 2
+    assert rows[0]["ticker"] == "NVDA"
+    assert rows[0]["rs_rating"] is None
+    assert rows[0]["pp_quality"] is None
 
 
 def test_signal_repository_deduplicates_by_user_ticker_and_date():
