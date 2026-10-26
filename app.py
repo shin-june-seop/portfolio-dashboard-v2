@@ -35,6 +35,12 @@ from dashboard_v2.services.live_monitor_service import (
     format_recent_official_state_history,
     format_buy_history,
 )
+from dashboard_v2.services.chart_service import (
+    aggregate_current_session_bar,
+    build_chart_figure,
+    is_xnys_regular_session_open,
+    relative_strength_latest,
+)
 from dashboard_v2.services.pp_journal_repository import (
     ENTRY_STAGES, EXIT_REASONS, PPJournalValidationError,
     add_pp_trade_add, add_pp_trade_exit, create_pp_trade,
@@ -1183,6 +1189,135 @@ def _render_live_monitor_page(
     _live_monitor_fragment()
 
 
+def _render_chart_page(watchlist_rows: list[dict[str, Any]], source: str) -> None:
+    """Legacy-style Chart UI; official levels are read-only V2 EOD outputs."""
+    st.markdown("## 📊 Chart")
+    watch_symbols = active_tickers(watchlist_rows)
+    c1, c2 = st.columns([1.2, 1])
+    with c1:
+        selected = st.selectbox("관심종목", options=watch_symbols or ["—"], index=0, key="v2_chart_watchlist_ticker")
+    with c2:
+        typed = st.text_input("직접 입력 (아무 티커)", value="", key="v2_chart_typed_ticker", placeholder="예: AAPL").strip().upper()
+    ticker = typed or (selected if selected != "—" else "")
+    if not ticker:
+        st.info("관심종목을 선택하거나 직접 티커를 입력하세요.")
+        return
+    try:
+        from dashboard_v2.services.watchlist_repository import normalize_ticker
+        ticker = normalize_ticker(ticker)
+    except Exception as exc:
+        st.warning(f"티커 형식을 확인하세요: {exc}")
+        return
+    if source == "연결 안 함 (기본)":
+        st.info("차트를 보려면 왼쪽 **시장 데이터 → Yahoo Finance (EOD)** 를 선택하세요. Chart는 완료 일봉과 별도의 장중 관측 데이터만 사용합니다.")
+        return
+
+    try:
+        with st.spinner(f"{ticker} 완료 일봉과 공식 V2 EOD 기준선을 불러오는 중…"):
+            daily = _load_bars(ticker, source)
+            if daily is None or daily.empty:
+                st.warning(f"{ticker} 가격 데이터를 가져오지 못했습니다. 티커와 데이터 공급원을 확인하세요.")
+                return
+            daily = daily.copy()
+            daily["Date"] = pd.to_datetime(daily["Date"], errors="coerce")
+            daily = daily.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+            if daily.empty:
+                st.warning(f"{ticker}의 유효한 완료 일봉이 없습니다.")
+                return
+            benchmark_qqq = None
+            benchmark_spy = None
+            if source == "Yahoo Finance (EOD)":
+                try:
+                    benchmark_qqq = _load_yfinance_bars("QQQ")
+                except Exception:
+                    benchmark_qqq = None
+                try:
+                    benchmark_spy = _load_yfinance_bars("SPY")
+                except Exception:
+                    benchmark_spy = None
+            official = _analyze_cached(ticker, daily, _load_seed_state().get(ticker), benchmark_spy)
+            levels = {
+                "candidate": official.get("candidate_pivot"),
+                "candidate_source": official.get("candidate_pivot_source"),
+                "breakout": official.get("breakout_pivot"),
+                "breakout_source": official.get("breakout_pivot_source"),
+                "next_pivot": official.get("next_pivot_candidate"),
+                "next_pivot_source": official.get("next_pivot_candidate_source"),
+            }
+    except Exception as exc:
+        st.error(f"{ticker} 차트를 준비하지 못했습니다: {type(exc).__name__}: {exc}")
+        return
+
+    def _render_chart_view(live_bar: Mapping[str, Any] | None, live_error: str | None = None) -> None:
+        try:
+            figure = build_chart_figure(ticker, daily, live_bar=live_bar, benchmark_bars=benchmark_qqq, levels=levels)
+        except Exception as exc:
+            st.error(f"{ticker} 차트 계산 오류: {type(exc).__name__}: {exc}")
+            return
+        completed_closes = pd.to_numeric(daily["Close"], errors="coerce").dropna()
+        completed_close = float(completed_closes.iloc[-1])
+        if live_bar is not None:
+            current_price = float(live_bar["Close"])
+            previous_close = completed_close
+            price_time = f"LIVE {live_bar['time']}"
+        else:
+            current_price = completed_close
+            previous_close = float(completed_closes.iloc[-2]) if len(completed_closes) >= 2 else None
+            as_of = pd.Timestamp(daily["Date"].iloc[-1]).date().isoformat()
+            price_time = f"EOD {as_of} · 장외 또는 장중 데이터 없음"
+        change_pct = ((current_price / previous_close) - 1) * 100 if previous_close and previous_close > 0 else np.nan
+        rs_spy = pd.to_numeric(pd.Series([official.get("rs_3m_vs_spy_pct")]), errors="coerce").iloc[0]
+        qqq_ratio = relative_strength_latest(daily, benchmark_qqq)
+        details = []
+        if pd.notna(rs_spy):
+            details.append(f"RS vs SPY (3M) {float(rs_spy):+.2f}%p")
+        if qqq_ratio is not None:
+            details.append(f"QQQ 대비 누적 {qqq_ratio:.0f}")
+        line = f"**{ticker}** · ${current_price:,.2f} ({change_pct:+.2f}%)" if pd.notna(change_pct) else f"**{ticker}** · ${current_price:,.2f}"
+        if details:
+            line += " · " + " · ".join(details)
+        st.markdown(line + " · " + price_time)
+        st.plotly_chart(figure, use_container_width=True, config={"displayModeBar": False, "responsive": True}, key=f"v2_chart_{ticker}")
+        captions = []
+        for key, label, source_key in (("breakout", "돌파 Pivot", "breakout_source"), ("candidate", "Candidate Pivot", "candidate_source"), ("next_pivot", "Next Pivot", "next_pivot_source")):
+            try:
+                value = float(levels.get(key))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value) and value > 0:
+                suffix = f" ({levels[source_key]})" if levels.get(source_key) else ""
+                captions.append(f"{label} ${value:,.2f}{suffix}")
+        captions.extend(["일봉·Pivot·Stage는 V2 공식 EOD 엔진 기준", "3분마다 장중 차트 갱신" if source == "Yahoo Finance (EOD)" else "고정 회귀 데이터 · 장중 갱신 없음"])
+        if live_error:
+            captions.append(f"장중 데이터 없음: {live_error}")
+        if benchmark_qqq is None or getattr(benchmark_qqq, "empty", True):
+            captions.append("QQQ 상대 성과 데이터 없음")
+        st.caption(" · ".join(captions))
+
+    if source != "Yahoo Finance (EOD)":
+        _render_chart_view(None)
+        return
+
+    @st.fragment(run_every="3m")
+    def _live_chart_fragment() -> None:
+        now_ny = datetime.now(tz=LIVE_NY)
+        live_bar = None
+        live_error = None
+        # Provisional current-session observations are display-only. The daily frame
+        # and official pivot/stage analysis above remain outside this fragment.
+        if is_xnys_regular_session_open(now_ny):
+            try:
+                intraday = _load_live_intraday_bars(ticker)
+                live_bar = aggregate_current_session_bar(intraday, now=now_ny)
+                if live_bar is None:
+                    live_error = "현재 정규장 봉을 확인하지 못함"
+            except Exception as exc:
+                live_error = f"{type(exc).__name__}: {exc}"
+        _render_chart_view(live_bar, live_error)
+
+    _live_chart_fragment()
+
+
 def _save_auth_session(session) -> None:
     if session is None:
         return
@@ -2095,6 +2230,9 @@ elif page == "Quality Recovery":
 
 elif page == "PP Journal":
     _render_pp_journal_page(supabase_client, user_id, symbols, watchlist_rows)
+
+elif page == "Chart":
+    _render_chart_page(watchlist_rows, source)
 
 elif page in {"Momentum Monitor", "Pattern Scanner"}:
     if page == "Momentum Monitor":
