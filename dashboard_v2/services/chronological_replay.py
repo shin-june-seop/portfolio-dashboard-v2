@@ -45,7 +45,6 @@ def replay_symbol(
 
     candidate_pivot = initial_candidate_pivot
     breakout_pivot = initial_breakout_pivot
-    breakout_pivot_source = "INITIAL_STATE" if initial_breakout_pivot is not None else None
     breakout_date = pd.Timestamp(initial_breakout_date).date() if initial_breakout_date else None
     breakout_active = bool(initial_breakout_active and breakout_pivot is not None)
     rebase_state = RebaseState(active=False)
@@ -61,7 +60,6 @@ def replay_symbol(
     if resume_snapshot is not None:
         candidate_pivot = _optional_float(resume_snapshot.get("candidate_pivot"))
         breakout_pivot = _optional_float(resume_snapshot.get("breakout_pivot"))
-        breakout_pivot_source = (str(resume_snapshot.get("breakout_pivot_source") or "HISTORICAL_SOURCE_NOT_STORED") if breakout_pivot is not None else None)
         breakout_date = pd.Timestamp(resume_snapshot["breakout_date"]).date() if resume_snapshot.get("breakout_date") and pd.notna(resume_snapshot.get("breakout_date")) else None
         breakout_active = bool(resume_snapshot.get("breakout_cycle_active", False)) and breakout_pivot is not None
         previous_close = _optional_float(resume_snapshot.get("close"))
@@ -85,23 +83,14 @@ def replay_symbol(
     rows: list[dict[str, Any]] = []
 
     for idx in range(len(bars)):
-        history = bars.iloc[:idx + 1].copy().reset_index(drop=True)
+        # `bars` was normalized once above. These chronological views are
+        # read-only; copying and resetting the index at every replay step is wasteful.
+        history = bars.iloc[:idx + 1]
         bar = history.iloc[-1]
         asof = bar["Date"].date()
         if process_cutoff is not None and asof <= process_cutoff:
             continue
         close = float(bar["Close"])
-        # Keep replay-stage confirmation consistent with the canonical screen RVOL:
-        # current completed-bar volume divided by the mean volume of the prior 20
-        # completed bars (excluding today's volume). Without this input, the replay
-        # could emit BREAKOUT but could never emit BREAKOUT CONFIRMED.
-        prior_volumes = history["Volume"].iloc[-21:-1] if len(history) >= 21 else pd.Series(dtype=float)
-        avg_prior_volume = float(prior_volumes.mean()) if len(prior_volumes) == 20 else None
-        eod_rvol = (
-            float(bar["Volume"]) / avg_prior_volume
-            if avg_prior_volume is not None and avg_prior_volume > 0
-            else None
-        )
         prior_candidate = candidate_pivot
         prior_breakout = breakout_pivot
         prior_breakout_active = breakout_active
@@ -110,7 +99,7 @@ def replay_symbol(
         # RB-01 only needs the latest 20 completed bars; the active cycle low is
         # carried incrementally by the state machine, so passing the full prefix is
         # both unnecessary and a major historical-replay performance penalty.
-        trigger_history = history.tail(20).reset_index(drop=True)
+        trigger_history = history.tail(20)
         rebase_was_active = rebase_state.active
         updated_rebase = update_rebase_state(
             trigger_history, as_of_date=asof, close=close,
@@ -119,6 +108,7 @@ def replay_symbol(
             breakout_cycle_active=prior_breakout_active,
             previous_state=rebase_state,
             valid_new_pattern=False,
+            _normalized=True,
         )
 
         # Pattern scan is restricted to bars available as of this date. During a
@@ -128,18 +118,22 @@ def replay_symbol(
         # a 5-year replay practical; state triggers and low tracking still use the
         # complete history. This also prevents each daily scan from re-evaluating
         # thousands of irrelevant older bars.
-        detector_history = history.tail(120).reset_index(drop=True)
+        detector_history = history.tail(120)
         detector_breakout_date = breakout_date
         if detector_breakout_date is not None and detector_breakout_date < detector_history["Date"].iloc[0].date():
             # The first breakout event is outside the scan window. Do not let the
             # detector misinterpret a truncated window as containing that event.
             detector_breakout_date = None
-        candidate = pattern_detector(
-            detector_history,
-            rebase_started_at=updated_rebase.started_at if updated_rebase.active else None,
-            prior_breakout_pivot=prior_breakout,
-            prior_breakout_date=detector_breakout_date,
-        )
+        detector_kwargs = {
+            "rebase_started_at": updated_rebase.started_at if updated_rebase.active else None,
+            "prior_breakout_pivot": prior_breakout,
+            "prior_breakout_date": detector_breakout_date,
+        }
+        if pattern_detector is detect_primary_pattern:
+            # Only the built-in detector gets the internal fast path; injected
+            # test/custom detectors keep their existing validated call contract.
+            detector_kwargs["_normalized"] = True
+        candidate = pattern_detector(detector_history, **detector_kwargs)
         valid_candidate = bool(candidate and candidate.valid and candidate.candidate_pivot and candidate.pattern_start_date)
 
         # A valid new-cycle structure ends a rebase only when no fresh trigger is
@@ -152,6 +146,7 @@ def replay_symbol(
                 breakout_cycle_active=prior_breakout_active,
                 previous_state=updated_rebase,
                 valid_new_pattern=True,
+                _normalized=True,
             )
             # If the cycle ended, this candidate is allowed to become active.
             # If a new trigger kept it active, it remains diagnostic only.
@@ -197,7 +192,6 @@ def replay_symbol(
             breakout_cycle_active=breakout_active,
             next_pivot=active_candidate_pivot,
             next_pivot_valid=active_candidate_pivot is not None,
-            eod_rvol=eod_rvol,
         ))
 
         if stage.breakout_failure:
@@ -217,7 +211,6 @@ def replay_symbol(
                 # The Breakout Pivot changes only on an actual upward cross of a
                 # valid candidate pivot. Until then, keep the last historical value.
                 breakout_pivot = float(stage.activate_breakout_pivot)
-                breakout_pivot_source = candidate_source or "SOURCE_NOT_STORED"
                 breakout_date = asof
                 breakout_active = True
             elif updated_rebase.active:
@@ -233,28 +226,15 @@ def replay_symbol(
         if updated_rebase.active:
             breakout_active = False
 
-        next_pivot_candidate = None
-        next_pivot_candidate_source = None
-        if active_candidate_pivot is not None and (
-            not breakout_active or breakout_pivot is None or abs(float(active_candidate_pivot) - float(breakout_pivot)) > 1e-9
-        ):
-            next_pivot_candidate = float(active_candidate_pivot)
-            next_pivot_candidate_source = candidate_source
-
         rows.append({
             "ticker": symbol.upper(),
             "as_of_date": asof.isoformat(),
             "open": float(bar["Open"]), "high": float(bar["High"]),
             "low": float(bar["Low"]), "close": close, "volume": int(bar["Volume"]),
-            "eod_rvol": eod_rvol,
             "pattern": pattern_name,
             "pattern_start_date": candidate_start.isoformat() if candidate_start else None,
             "candidate_pivot": candidate_pivot,
-            "candidate_pivot_source": candidate_source,
             "breakout_pivot": breakout_pivot,
-            "breakout_pivot_source": breakout_pivot_source,
-            "next_pivot_candidate": next_pivot_candidate,
-            "next_pivot_candidate_source": next_pivot_candidate_source,
             "breakout_date": breakout_date.isoformat() if breakout_date else None,
             "breakout_cycle_active": breakout_active,
             "stage": stage.stage.value,
@@ -265,7 +245,6 @@ def replay_symbol(
             "rebase_reason": rebase_state.primary_reason,
             "rebase_secondary_reasons": "|".join(rebase_state.secondary_reasons),
             "breakout_event": stage.breakout_event,
-            "breakout_confirmed": stage.breakout_confirmed,
             "breakout_failure": stage.breakout_failure,
             "prior_candidate_pivot": prior_candidate,
             "prior_breakout_pivot": prior_breakout,
