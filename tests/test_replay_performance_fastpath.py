@@ -67,3 +67,34 @@ def test_normalized_and_public_pattern_detection_return_identical_candidates() -
     public_result = detect_primary_pattern(raw)
     fast_result = detect_primary_pattern(normalized, _normalized=True)
     assert fast_result == public_result
+
+
+def test_primary_fast_path_matches_full_detector_priority_for_regression_windows() -> None:
+    """The replay fast path must select the same pattern/pivot as the full detector suite."""
+    from dashboard_v2.engines.pattern_engine import select_primary_pattern
+    from dashboard_v2.engines.pattern_detectors import detect_pattern_candidates
+
+    cases = [
+        ("AMAT", None, None, None),
+        ("GOOG", None, 300.0, "2026-06-15"),
+        ("STX", "2026-08-01", None, None),
+    ]
+    for ticker, rebase_started_at, prior_breakout_pivot, prior_breakout_date in cases:
+        raw = pd.read_csv(ROOT / "data" / "regression" / "ohlcv" / f"{ticker}.csv").tail(120)
+        frame = raw.copy()
+        frame["Date"] = pd.to_datetime(frame["Date"])
+        fast = detect_primary_pattern(
+            frame,
+            rebase_started_at=rebase_started_at,
+            prior_breakout_pivot=prior_breakout_pivot,
+            prior_breakout_date=prior_breakout_date,
+            _normalized=True,
+        )
+        full = select_primary_pattern(detect_pattern_candidates(
+            frame,
+            rebase_started_at=rebase_started_at,
+            prior_breakout_pivot=prior_breakout_pivot,
+            prior_breakout_date=prior_breakout_date,
+            _normalized=True,
+        ))
+        assert fast == full
