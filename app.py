@@ -190,6 +190,7 @@ def _run_scan(
     source: str,
     *,
     progress_callback: Callable[[str, int, int, str], None] | None = None,
+    diagnostics_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], list[tuple[str, str]], float]:
     """Fetch bars concurrently, then run independent per-symbol EOD replays concurrently.
 
@@ -202,6 +203,11 @@ def _run_scan(
     requested = list(dict.fromkeys(str(s).upper().strip() for s in symbols if str(s).strip()))
     errors: list[tuple[str, str]] = []
     fetched: dict[str, pd.DataFrame] = {}
+    # Per-symbol timings make a cold cache distinguishable from a persistent hot spot.
+    # Times are measured around the cached function call, so they include cache-key
+    # hashing/lookup on hits and the actual work on misses.
+    download_diagnostics: list[dict[str, Any]] = []
+    analysis_diagnostics: list[dict[str, Any]] = []
     download_symbols = list(requested)
     if source == "Yahoo Finance (EOD)" and "SPY" not in download_symbols:
         download_symbols.append("SPY")
@@ -218,18 +224,37 @@ def _run_scan(
 
     # Yahoo/network latency is the main first-run bottleneck. Bounded concurrency
     # avoids serial 15-second waits while not launching one thread per watchlist item.
+    def _timed_download(ticker: str):
+        started_at = time.perf_counter()
+        try:
+            bars = _load_bars(ticker, source)
+            return bars, time.perf_counter() - started_at, None
+        except Exception as exc:
+            return None, time.perf_counter() - started_at, exc
+
     notify("download", 0, max(1, download_total), "시작")
     if download_symbols:
         workers = min(6, len(download_symbols))
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v2-eod-fetch") as pool:
-            futures = {pool.submit(_load_bars, ticker, source): ticker for ticker in download_symbols}
+            futures = {pool.submit(_timed_download, ticker): ticker for ticker in download_symbols}
             completed = 0
             for future in as_completed(futures):
                 ticker = futures[future]
                 completed += 1
                 try:
-                    bars = future.result()
-                    if isinstance(bars, pd.DataFrame) and not bars.empty:
+                    bars, seconds, fetch_error = future.result()
+                    is_valid = isinstance(bars, pd.DataFrame) and not bars.empty
+                    download_diagnostics.append({
+                        "종목": ticker,
+                        "소요시간(초)": round(float(seconds), 3),
+                        "일봉 수": int(len(bars)) if is_valid else 0,
+                        "상태": "OK" if is_valid and fetch_error is None else ("오류" if fetch_error else "일봉 없음"),
+                        "오류": f"{type(fetch_error).__name__}: {fetch_error}" if fetch_error else "",
+                    })
+                    if fetch_error is not None:
+                        label = "SPY benchmark" if ticker == "SPY" and ticker not in requested else ticker
+                        errors.append((label, f"{type(fetch_error).__name__}: {fetch_error}"))
+                    elif is_valid:
                         fetched[ticker] = bars
                     elif ticker in requested:
                         errors.append((ticker, "NO_DAILY_BARS"))
@@ -237,6 +262,10 @@ def _run_scan(
                         errors.append(("SPY benchmark", "NO_DAILY_BARS"))
                 except Exception as exc:
                     label = "SPY benchmark" if ticker == "SPY" and ticker not in requested else ticker
+                    download_diagnostics.append({
+                        "종목": ticker, "소요시간(초)": None, "일봉 수": 0,
+                        "상태": "오류", "오류": f"{type(exc).__name__}: {exc}",
+                    })
                     errors.append((label, f"{type(exc).__name__}: {exc}"))
                 notify("download", completed, download_total, ticker)
 
@@ -244,12 +273,22 @@ def _run_scan(
     benchmark = fetched.get("SPY") if source == "Yahoo Finance (EOD)" else None
 
     # Replay is sequential within each ticker, parallel only across independent tickers.
+    # Measure the full cached call: on cold runs this includes the engine; on warm runs
+    # it captures the cache hashing/lookup overhead and should fall sharply if caching works.
+    def _timed_analysis(ticker: str, bars: pd.DataFrame):
+        started_at = time.perf_counter()
+        try:
+            result = _analyze_cached(ticker, bars, seed.get(ticker), benchmark)
+            return result, time.perf_counter() - started_at, None
+        except Exception as exc:
+            return None, time.perf_counter() - started_at, exc
+
     rows_by_symbol: dict[str, dict[str, Any]] = {}
     if raw:
         notify("analysis", 0, len(raw), "시작")
         with ThreadPoolExecutor(max_workers=min(4, len(raw)), thread_name_prefix="v2-eod-engine") as pool:
             futures = {
-                pool.submit(_analyze_cached, ticker, bars, seed.get(ticker), benchmark): ticker
+                pool.submit(_timed_analysis, ticker, bars): ticker
                 for ticker, bars in raw.items()
             }
             completed = 0
@@ -257,13 +296,45 @@ def _run_scan(
                 ticker = futures[future]
                 completed += 1
                 try:
-                    rows_by_symbol[ticker] = future.result()
+                    result, seconds, analysis_error = future.result()
+                    if analysis_error is not None:
+                        errors.append((ticker, f"Analysis {type(analysis_error).__name__}: {analysis_error}"))
+                        analysis_diagnostics.append({
+                            "종목": ticker, "소요시간(초)": round(float(seconds), 3),
+                            "일봉 수": int(len(raw[ticker])), "재생 경로": "오류",
+                            "오류": f"{type(analysis_error).__name__}: {analysis_error}",
+                        })
+                    else:
+                        rows_by_symbol[ticker] = result
+                        analysis_diagnostics.append({
+                            "종목": ticker, "소요시간(초)": round(float(seconds), 3),
+                            "일봉 수": int(result.get("data_rows", len(raw[ticker]))),
+                            "재생 경로": str(result.get("replay_provenance", "알 수 없음")),
+                            "오류": "",
+                        })
                 except Exception as exc:
                     errors.append((ticker, f"Analysis {type(exc).__name__}: {exc}"))
+                    analysis_diagnostics.append({
+                        "종목": ticker, "소요시간(초)": None,
+                        "일봉 수": int(len(raw[ticker])), "재생 경로": "오류",
+                        "오류": f"{type(exc).__name__}: {exc}",
+                    })
                 notify("analysis", completed, len(raw), ticker)
 
     rows = [rows_by_symbol[ticker] for ticker in requested if ticker in rows_by_symbol]
     elapsed = time.perf_counter() - start
+    if diagnostics_callback is not None:
+        try:
+            diagnostics_callback({
+                "download": sorted(download_diagnostics, key=lambda item: item.get("소요시간(초)") or 0, reverse=True),
+                "analysis": sorted(analysis_diagnostics, key=lambda item: item.get("소요시간(초)") or 0, reverse=True),
+                "total_seconds": round(float(elapsed), 3),
+                "download_workers": min(6, len(download_symbols)) if download_symbols else 0,
+                "analysis_workers": min(4, len(raw)) if raw else 0,
+            })
+        except Exception:
+            # Diagnostics must not change scan results.
+            pass
     return pd.DataFrame(rows), raw, errors, elapsed
 
 
@@ -2340,6 +2411,7 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
         scan_bar = st.progress(0.0, text="스캔 준비 중…")
         scan_status = st.empty()
         scan_started_at = time.perf_counter()
+        scan_diagnostics: dict[str, Any] = {}
         scan_phase_state: dict[str, Any] = {
             "name": None,
             "started_at": scan_started_at,
@@ -2366,7 +2438,10 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
             scan_status.caption("종목별 다운로드와 분석은 병렬 처리 중이며, 한 종목 안의 공식 날짜순 재생은 순서대로 유지합니다.")
 
         try:
-            result, raw, errors, elapsed = _run_scan(symbols, source, progress_callback=_scan_progress)
+            result, raw, errors, elapsed = _run_scan(
+                symbols, source, progress_callback=_scan_progress,
+                diagnostics_callback=scan_diagnostics.update,
+            )
         finally:
             current_phase = scan_phase_state["name"]
             if current_phase is not None:
@@ -2382,6 +2457,32 @@ elif page in {"Momentum Monitor", "Pattern Scanner"}:
             f"전체 {max(elapsed, time.perf_counter() - scan_started_at):.1f}s · "
             f"다운로드 최대 6개 / 엔진 최대 4개 종목 병렬 처리"
         )
+        with st.expander("종목별 상세 성능 진단", expanded=False):
+            st.caption(
+                "종목별 시간은 병렬 작업 각각의 경과 시간이라 합계가 화면 전체 시간과 같지 않습니다. "
+                "첫 실행과 같은 기준일로 재실행했을 때 엔진 호출 시간이 크게 줄면 캐시가 정상적으로 재사용되는 것입니다. "
+                "재생 경로가 ROLLING_260_BAR_REPLAY인 종목은 저장된 호환 스냅샷 없이 최근 260개 봉을 재생합니다."
+            )
+            diag_left, diag_right = st.columns(2)
+            download_diag = pd.DataFrame(scan_diagnostics.get("download", []))
+            analysis_diag = pd.DataFrame(scan_diagnostics.get("analysis", []))
+            with diag_left:
+                st.markdown("**일봉 다운로드 — 느린 순**")
+                if not download_diag.empty:
+                    st.dataframe(download_diag, use_container_width=True, hide_index=True)
+                else:
+                    st.info("다운로드 상세 기록이 없습니다.")
+            with diag_right:
+                st.markdown("**공통 EOD 엔진 호출 — 느린 순**")
+                if not analysis_diag.empty:
+                    st.dataframe(analysis_diag, use_container_width=True, hide_index=True)
+                else:
+                    st.info("엔진 상세 기록이 없습니다.")
+            st.caption(
+                f"작업자 수: 다운로드 {scan_diagnostics.get('download_workers', '—')} · "
+                f"엔진 {scan_diagnostics.get('analysis_workers', '—')} · "
+                f"전체 경과 {scan_diagnostics.get('total_seconds', elapsed):.1f}s"
+            )
         if result.empty:
             st.error("분석할 수 있는 종목이 없습니다. 데이터 공급원과 심볼을 확인하세요.")
             if page == "Momentum Monitor":
