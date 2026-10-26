@@ -172,7 +172,7 @@ def _load_seed_state() -> dict:
     return load_seed_snapshots()
 
 
-@st.cache_data(ttl=60 * 60, show_spinner=False)
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def _analyze_cached(symbol: str, bars: pd.DataFrame, seed_snapshot: dict | None, benchmark: pd.DataFrame | None) -> dict:
     return analyze_symbol(symbol, bars, seed_snapshot=seed_snapshot, benchmark_bars=benchmark)
 
