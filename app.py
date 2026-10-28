@@ -24,7 +24,16 @@ st.set_page_config(page_title="연저펀 대시보드", page_icon="📈", layout
 st.markdown("""
 <style>
     .block-container {padding-top: 1.35rem; padding-bottom: 2rem; max-width: 1600px;}
-    [data-testid="stMetric"] {background: rgba(128,128,128,0.08); padding: 14px 16px; border-radius: 12px; border: 1px solid rgba(128,128,128,0.16);}
+    [data-testid="stMetric"] {background: rgba(128,128,128,0.08); padding: 14px 16px; border-radius: 12px; border: 1px solid rgba(128,128,128,0.16); min-width: 0;}
+    /* Large KRW KPI values can overflow their cards on smaller screens. */
+    .st-key-pension_top_kpis [data-testid="stMetricValue"],
+    .st-key-pension_top_kpis [data-testid="stMetricValue"] > div {
+        font-size: clamp(1rem, 1.4vw, 1.35rem) !important;
+        line-height: 1.2 !important;
+        white-space: nowrap !important;
+        overflow: visible !important;
+    }
+    .st-key-pension_top_kpis [data-testid="stMetricLabel"] {font-size: 0.9rem !important;}
     h1, h2, h3 {letter-spacing: -0.025em;}
     div[data-testid="stDataFrame"] {border-radius: 10px;}
 </style>
@@ -209,11 +218,14 @@ def show_kpis(summary: dict[str, float], latest_month: dict[str, Any] | None = N
     delta = None
     if latest_month and latest_month.get("return_change") is not None and pd.notna(latest_month.get("return_change")):
         delta = f"전월 대비 {float(latest_month['return_change']) * 100:+.2f}%p"
-    cols = st.columns(4)
-    cols[0].metric("현재 평가금", display_number(summary["market_value"]))
-    cols[1].metric("누적 투자금", display_number(summary["invested"]))
-    cols[2].metric("평가손익", display_number(summary["profit"]), display_percent(summary["return_pct"]))
-    cols[3].metric("최근 월말 수익률", display_percent(latest_month.get("return_pct") if latest_month else None), delta)
+    # A named container lets CSS resize the two long KRW values without shrinking
+    # percentages elsewhere in the app.
+    with st.container(key="pension_top_kpis"):
+        cols = st.columns(4)
+        cols[0].metric("현재 평가금", display_number(summary["market_value"]))
+        cols[1].metric("누적 투자금", display_number(summary["invested"]))
+        cols[2].metric("평가손익", display_number(summary["profit"]), display_percent(summary["return_pct"]))
+        cols[3].metric("최근 월말 수익률", display_percent(latest_month.get("return_pct") if latest_month else None), delta)
 
 
 def render_overview(data: dict[str, list[dict[str, Any]]], holdings_df: pd.DataFrame) -> None:
@@ -253,6 +265,74 @@ def render_overview(data: dict[str, list[dict[str, Any]]], holdings_df: pd.DataF
         fig.update_layout(template="plotly_dark", height=360, margin=dict(l=10, r=10, t=25, b=10), legend=dict(orientation="h", y=1.08))
         fig.update_yaxes(title="원화 (KRW)", tickformat=",.0f")
         st.plotly_chart(fig, use_container_width=True)
+
+        # Combo chart inspired by the spreadsheet: grouped monthly bars plus a
+        # cumulative-return line on a secondary percentage axis.
+        st.subheader("월별 투자금·평가금과 누적 수익률")
+        combo = history.copy()
+        combo["month_label"] = combo["record_month"].dt.strftime("%Y-%m")
+        invested_values = pd.to_numeric(combo["invested_amount"], errors="coerce")
+        balance_values = pd.to_numeric(combo["total_balance"], errors="coerce")
+        profit_values = pd.to_numeric(
+            combo.get("profit", pd.Series(index=combo.index, dtype="float64")), errors="coerce"
+        ).fillna(balance_values - invested_values)
+        return_values = pd.to_numeric(
+            combo.get("return_pct", pd.Series(index=combo.index, dtype="float64")), errors="coerce"
+        )
+        months = combo["month_label"].fillna("").tolist()
+
+        combo_fig = go.Figure()
+        combo_fig.add_trace(go.Bar(
+            x=months, y=balance_values, name="총잔고(평가금)",
+            marker_color="#f01414",
+            hovertemplate="%{x}<br>총잔고: ₩%{y:,.0f}<extra></extra>",
+        ))
+        combo_fig.add_trace(go.Bar(
+            x=months, y=invested_values, name="누적 투자금",
+            marker_color="#1769d2",
+            hovertemplate="%{x}<br>누적 투자금: ₩%{y:,.0f}<extra></extra>",
+        ))
+        combo_fig.add_trace(go.Bar(
+            x=months, y=profit_values, name="수익금",
+            marker_color="#10a35a",
+            hovertemplate="%{x}<br>수익금: ₩%{y:,.0f}<extra></extra>",
+        ))
+        if return_values.notna().any():
+            return_labels = [f"{v:.1%}" if pd.notna(v) else "" for v in return_values]
+            max_return = max(0.0, float(return_values.max()))
+            right_axis_max = max(0.8, (int(max_return / 0.2) + 1) * 0.2)
+            combo_fig.add_trace(go.Scatter(
+                x=months, y=return_values, name="누적 수익률",
+                mode="lines+markers+text", text=return_labels,
+                textposition="top center", cliponaxis=False,
+                textfont=dict(size=9, color="#222222"),
+                line=dict(color="#222222", width=2.5),
+                marker=dict(color="#222222", size=5),
+                yaxis="y2",
+                hovertemplate="%{x}<br>누적 수익률: %{y:.1%}<extra></extra>",
+            ))
+        else:
+            right_axis_max = 0.8
+        combo_fig.update_layout(
+            template="plotly_white", barmode="group", height=460,
+            margin=dict(l=12, r=22, t=28, b=78),
+            bargap=0.22, bargroupgap=0.04,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            xaxis=dict(
+                title=None, tickangle=-45, tickfont=dict(size=9),
+                categoryorder="array", categoryarray=months,
+            ),
+            yaxis=dict(
+                title="금액 (원)", tickformat=",.0f",
+                gridcolor="#dedede", zerolinecolor="#a8a8a8",
+            ),
+            yaxis2=dict(
+                title="누적 수익률", overlaying="y", side="right",
+                tickformat=".0%", dtick=0.2, range=[0, right_axis_max],
+                showgrid=False, zeroline=False,
+            ),
+        )
+        st.plotly_chart(combo_fig, use_container_width=True)
 
     if not holdings_df.empty:
         st.subheader("목표 비중 vs 현재 비중")
