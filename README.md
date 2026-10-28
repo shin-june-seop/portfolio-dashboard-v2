@@ -1,131 +1,41 @@
-# Portfolio Dashboard V2 — Watchlist + Live Monitor
+# 연저펀 대시보드
 
-This is a clean-room rebuild, not a refactor of the legacy monolithic `app.py`. The legacy app is used only to inventory data requirements and preserve regression examples. The current milestone connects the shared chronological engine to Momentum Monitor and Pattern Scanner; it does not claim that every legacy screen or live DB integration is complete.
+기존 엑셀의 연저펀 포트폴리오, 월말 수익률, ETF 주간 수익률만 관리하도록 단순화한 Streamlit 앱입니다. 모멘텀 모니터, 피벗/패턴 스캐너, 라이브 매매 신호, 매매 주문 기능은 포함하지 않습니다.
 
-## Current state
+## 메뉴
 
-- V2-only authenticated watchlist CRUD (`public.v2_watchlist`) is the first persistent user-data feature. It uses a clean, separate Supabase project, email/password sign-in, row-level security, and no legacy-data import. See `WATCHLIST_SETUP.md`.
-- Enabled watchlist symbols are the shared source for Momentum Monitor, Live Monitor, and Pattern Scanner. Live Monitor consumes provisional Yahoo Finance 5-minute bars separately from the official completed-daily-bar engine. PP Journal records saved Pocket Pivot signals separately from actual trades. Quality Recovery ports the legacy V30 Quality Recovery Radar: annual Yahoo Finance income/revenue growth, 120/200MA event states, correction, and V30.5 RS vs QQQ.
+- **대시보드**: 현재 보유 현황, 평가손익, 목표 비중 대비 현재 비중, 월말 잔고 추이
+- **월말 기록**: 누적 투자금·총잔고·수익금·수익률 그래프, 월별 기록 추가
+- **ETF 주간 성과**: 4개 ETF 누적 수익률 비교 및 주간 기록 추가
+- **데이터 관리**: 기존 `연저펀` 및 `연저펀주간수익률` 시트 가져오기, 보유 종목 값 수정
 
-Implemented and unit-tested:
-- Canonical OHLCV normalization and data validation.
-- Pivot distance, PIVOT APPROACH, EOD Stage transitions, Entry Quality normalization/extension gate.
-- Initial Risk and monotonic ATR trailing stop with EOD-only exit-signal creation.
-- Pocket Pivot core volume and moving-average context rules.
-- Nine initial OHLCV pattern detectors plus one primary-pattern selector.
-- Synthetic-fixture tests for detector geometry and rebase boundary handling.
-- Yahoo Finance daily-bar adapter with a 16:15 ET finalization buffer, XNYS session freshness checks, split-normalized technical OHLC, and separate dividend/split-adjusted Adj Close for holding-period returns.
-- Momentum Monitor and Pattern Scanner connected to one shared analysis service with candidate/breakout pivot distances, 20D reference, official EOD stage, rebase state, RVOL, returns, and optional relative strength vs SPY.
-- Incremental chronological replay from the seven bundled state snapshots when the historical close matches; unseeded symbols use a clearly labelled rolling 300-bar replay.
-- Local historical OHLCV capture utility and a regression runner that differentiates observed output from chart-labelled PASS/FAIL.
-- Static Supabase call-site inventory from legacy source; live schema/RLS not inspected.
+## 현재가 처리
 
-## Still unverified / disconnected
+원본 GoogleFinance 수식은 앱에서 실행하지 않습니다. 국내 ETF 티커 뒤에 `.KS`를 붙여 Yahoo Finance에서 장중 1분봉을 우선 조회하고, 실패하면 최근 일봉 종가를 사용합니다. 두 조회가 모두 실패하면 엑셀에 저장된 마지막 가격을 백업값으로 표시하며, 가격 출처/기준일을 함께 보여줍니다. 이 값은 주문 전송이나 자동 매매에 사용되지 않습니다.
 
-- Actual historical chart regressions for AMAT/MU/SOXX/META/GOOG/STX/LRCX. Dates and expected outcomes are intentionally not guessed.
-- Yahoo Finance is approved for V2 EOD analysis under the explicit policy in `DATA_SOURCE_POLICY.md`; upstream values may be revised and this is not an automatic-trading approval.
-- Broad historical pattern-label validation and a cloud browser smoke test for each deployed revision.
-- Watchlist and PP Journal persistence require the dedicated V2 Supabase project and corresponding SQL schemas. Quality Recovery uses Yahoo Finance and does not require SEC credentials or additional Secrets.
-- Live Monitor is implemented as a read-only intraday view; it does not persist live state or official events. Quality Recovery preserves the legacy annual statement rules. Its legacy `EPS Growth` label is based on annual Net Income growth, not true per-share EPS; missing statements stay CHECK.
+지원 티커: `390390.KS`, `402970.KS`, `360750.KS`, `367380.KS`. Yahoo Finance가 특정 종목의 시세를 제공하지 않는 시간에는 백업값을 사용하므로 표시된 가격 기준일을 확인하세요.
 
-Pattern thresholds are initial automation heuristics from Functional Spec v0.12, not universal chart-pattern truths. V2 is not a production trade-signal system yet.
+## Streamlit Cloud 배포
 
-## Watchlist deployment
+1. 기존 GitHub 저장소에서 앱 코드와 파일을 이 버전으로 교체합니다. 기존 앱 기능 파일은 이 버전에 포함하지 않습니다.
+2. 기존 V2 Supabase 프로젝트의 SQL Editor에서 `sql/pension_dashboard_schema.sql`을 한 번 실행합니다. 이 SQL은 `pension_*` 테이블만 만들며 기존 `v2_watchlist` 등 테이블을 삭제/변경하지 않습니다.
+3. Streamlit Community Cloud Secrets에 `SUPABASE_URL`, `SUPABASE_ANON_KEY`를 설정합니다. `service_role` 키를 사용하지 않습니다.
+4. 기존 Supabase Auth 사용자를 사용해 로그인합니다.
+5. **데이터 관리** 메뉴에서 엑셀 파일을 업로드하고 `엑셀 데이터 가져오기`를 누릅니다.
 
-1. Create a new empty Supabase project.
-2. Run `sql/v2_watchlist_schema.sql` in that project.
-3. Create your login user in Supabase Authentication → Users; disable public sign-ups if desired.
-4. Add `SUPABASE_URL` and `SUPABASE_ANON_KEY` to Streamlit Cloud app Secrets. Never use the `service_role` key.
-5. See `WATCHLIST_SETUP.md` for full steps.
-6. Quality Recovery does not need new SQL or SEC Secrets. It reads the active V2 Watchlist, completed Yahoo EOD bars, and Yahoo annual income statements.
+Supabase가 설정되어 있지 않으면 앱은 임시 세션 모드로 열리지만, 저장 내용이 세션 종료 후 보존되지 않습니다. 영구 저장에는 Supabase 설정과 위 SQL 실행이 필요합니다.
 
-## Safety boundaries
-
-- V2 writes only user-owned rows to the new `v2_watchlist` table after login and RLS checks. It does not access or modify legacy tables.
-- No order submission, broker connection, automatic position closure, or invented account data.
-- Existing dashboard remains untouched until V2 acceptance checks pass.
-
-## Run locally (Windows PowerShell)
-
-From the project folder, the most robust workflow avoids PowerShell activation entirely:
+## 로컬 실행 (Windows / Python 3.13)
 
 ```powershell
 py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[test]"
-.\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
-Optional market-data capture requires network access and the yfinance extra:
+## 보안 및 데이터
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[test,market-data]"
-.\.venv\Scripts\python.exe tools/capture_historical_ohlcv.py
-.\.venv\Scripts\python.exe tools/run_historical_regression.py
-```
-
-The capture writes only local files under `data/regression/ohlcv/`. Fill `data/regression/manifest.csv` with exact chart-reviewed dates and expected results before treating any case as validated. `OBSERVED_NOT_VALIDATED` is not a passing regression.
-
-## Supabase inventory
-
-- `docs/legacy_db_inventory/LEGACY_DB_INVENTORY.md`: static summary.
-- `docs/legacy_db_inventory/legacy_db_operations.csv`: call-site detail.
-- `tools/inventory_legacy_db.py`: rerunnable static scanner.
-
-These documents do not replace inspection of the actual live Supabase schema and security policies.
-
-## Source of truth
-
-`Dashboard_V2_Functional_Spec_v0.12.md` is the functional source of truth. `ARCHITECTURE.md` documents module boundaries, and `PHASE3_IMPLEMENTATION.md` records the phase deliverables; `PHASE3_1_FIX_REPORT.md` documents the Date-index bug and fix. Rule changes should update specification/config/tests together.
-
-## Phase 3.2: audit and historical review
-
-See `PHASE3_2_IMPLEMENTATION.md` and `docs/HISTORICAL_REVIEW_WORKFLOW.md`. With the captured CSVs copied into `data/regression/ohlcv`, run:
-
-```powershell
-.\.venv\Scripts\python.exe tools/audit_historical_ohlcv.py
-.\.venv\Scripts\python.exe tools/build_rebase_review.py
-.\.venv\Scripts\python.exe -m pytest
-```
-
-The first two commands are local, read-only review tools. They do not access the internet or Supabase.
-
-
-## Phase 3.3 review tools
-
-After auditing OHLCV and building the rebase snapshot worksheet, use these local-only tools:
-
-```powershell
-.\.venv\Scripts\python.exe tools/review_ohlcv_large_moves.py
-.\.venv\Scripts\python.exe tools/summarize_rebase_review.py
-```
-
-These create an event-date worksheet for large close moves and a cycle-level summary of sampled post-rebase patterns. They do not label any historical case as ground truth. See `PHASE3_3_IMPLEMENTATION.md`.
-
-## Momentum Monitor / Pattern Scanner (Phase 4)
-
-The two core screens now consume the same `dashboard_v2.services.screening_service.analyze_symbol` output. The screens do not independently recalculate candidate pivots, breakout pivots, rebase state, or official stage.
-
-### Run locally for development
-
-Use Python 3.13:
-
-```powershell
-py -3.13 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe -m streamlit run app.py
-```
-
-In the sidebar, choose a data source explicitly. `Yahoo Finance (EOD)` fetches split-normalized OHLC plus a separate `Adj Close` series. It withholds the current US session until 16:15 ET, validates the expected latest XNYS session, and fails closed on missing/stale required data. Multi-period returns/RS use `Adj Close`; technical pivots use OHLC. `Bundled regression data (historical)` is a fixed historical fixture ending 2026-10-19 and must not be interpreted as live market data.
-
-### Streamlit Community Cloud
-
-Deploy this repository with `app.py` as the entry point. Cloud installation uses `requirements.txt`. Supabase is required for the authenticated V2 Watchlist; configure `SUPABASE_URL` and `SUPABASE_ANON_KEY` in Streamlit Secrets, using only the public anon/publishable key. Live Monitor additionally fetches provisional Yahoo Finance 5-minute bars and uses the last completed EOD output as its pattern/pivot baseline. Yahoo values may be delayed, incomplete, or revised. Live calculations never overwrite official EOD stage/history; stale data disables live signals, and the app stays read-only with no automatic orders.
-
-### Historical state note
-
-The historical fixture mode can use its matching bundled replay snapshot. Yahoo EOD bars use a separate split-normalized OHLC basis, so they intentionally do not resume the legacy auto-adjusted seed; they use a transparent rolling 300-bar replay. For those symbols, older breakout history beyond the window may not be reconstructed. All bundled states remain engine-generated starting states, not independently labelled ground truth.
-
-## Phase 11: Overview Index Panels
-
-Overview now displays compact S&P 500, Nasdaq Composite, and Dow candlestick cards using only the latest two completed daily index bars. Blue relative-volume bars are explicitly labelled ETF-proxy data (SPY/QQQ/DIA) rather than index volume and are not inputs to the Market Score or technical engines. The standalone Market Regime sidebar entry was removed; Market Score / Market Regime remains at the top of Momentum Monitor. No Supabase schema or Secrets changes are required.
+- 업로드한 원본 파일의 계좌번호는 가져오지 않습니다.
+- 실제 계좌 정보가 담긴 엑셀 파일은 GitHub 저장소에 커밋하지 마세요. 앱 화면에서 직접 업로드합니다.
+- 인증된 사용자는 자신의 `user_id`에 해당하는 행만 RLS 정책으로 조회/수정할 수 있습니다.
+- 기존 매매/분석 데이터베이스 테이블은 이 앱에서 읽거나 수정하지 않습니다.
